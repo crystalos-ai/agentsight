@@ -1,0 +1,62 @@
+{
+  "change_owner": "Gauransh Tandon",
+  "parent_revision": "b2ffc81e834a542d0047d792954adb0741e2210f",
+  "source_files_sha256": {
+    "ext/session/src/work_request.rs": "df1e9e5662258c195e11eeb2ef4458a7c27be85c2ae861ee11232b6ec65cc9a7",
+    "ext/session/src/lib.rs": "87b8755b36bee30869d122945fdc28b7132f4acf25960992eb62fd822cf2f185",
+    "ext/session/src/parser.rs": "cf646b26e667d8643f551f5d8ede4a54ca4ae61e88941ff41aa6bd7df7092693",
+    "ext/analysis/src/sources/agent_native.rs": "b53f002db8c19064d6bb74122143c06f0cd1ddfea9b468bc55b01f5b16587a49",
+    "ext/analysis/src/sources/session_work.rs": "6f8308910e68119c20bf7e7fdb8440f21dc9a80cbfafdc59d070611a47984512",
+    "ext/analysis/src/sources/mod.rs": "3cc231cb1ff749d58e76719486cc388d0b84954970c6572c6d80a5ff2e840d79"
+  },
+  "review_comments": [
+    4313190619,
+    4313190753,
+    4313212926
+  ],
+  "review_fixes": [
+    "Balanced quote, backtick, fence and tag parsing; malformed first request abstains without later fallthrough",
+    "Ordinary spaced and unspaced less-than comparisons preserved",
+    "Generic rest/support/find/why matches narrowed; explicit Bug/Test investigations preserved",
+    "Bounded read trims incomplete trailing UTF-8 only when file continues; interior corruption and actual incomplete EOF refused",
+    "Strict Clippy manual_contains and manual_strip findings fixed"
+  ],
+  "checks": [
+    {
+      "command": "rtk cargo test --manifest-path ext/session/Cargo.toml",
+      "passed": 50
+    },
+    {
+      "command": "rtk cargo test --manifest-path ext/analysis/Cargo.toml",
+      "passed": 160
+    },
+    {
+      "command": "rtk proxy env AGENTSIGHT_WORK_FIXTURE_OUTPUT=/absolute/output/host-sessions.json cargo test --manifest-path collector/Cargo.toml source_fixtures_produce_closed_work_metadata -- --nocapture",
+      "passed": 1
+    },
+    {
+      "command": "rtk cargo clippy --manifest-path ext/session/Cargo.toml --all-targets -- -D warnings",
+      "status": "PASS"
+    },
+    {
+      "command": "rtk cargo clippy --manifest-path ext/analysis/Cargo.toml --all-targets -- -D warnings",
+      "status": "PASS"
+    },
+    {
+      "command": "rtk proxy rustfmt --edition 2024 --config skip_children=true --check ext/session/src/work_request.rs ext/session/src/lib.rs ext/session/src/parser.rs ext/analysis/src/sources/agent_native.rs ext/analysis/src/sources/session_work.rs ext/analysis/src/sources/mod.rs",
+      "status": "PASS"
+    }
+  ],
+  "independent_classifier_cases": {
+    "passed": 13,
+    "included_in_analysis_suite": true
+  },
+  "fixture": {
+    "sha256": "ad0295a46e4726a4be79a88705cb10ab4eb96ad56cb34273bc0805406528bd81",
+    "unchanged_from_engine_browser_evidence": true,
+    "source": "Actual native parser and host-session wire projection over synthetic source fixtures"
+  },
+  "independent_review": "No remaining actionable findings after final native-reader and delimiter review; independent 3-test delimiter rerun passed.",
+  "formatting_limit": "Whole analysis-crate fmt reports existing differences in unchanged bridge/metadata.rs and lib.rs; changed Rust files pass formatting.",
+  "delivery": "Local source validation only. New remote CI and any publication/deployment are separate."
+}

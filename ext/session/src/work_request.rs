@@ -97,6 +97,9 @@ pub fn first_user_request(agent: &str, content: &str) -> Option<String> {
         .iter()
         .any(|prefix| trimmed.starts_with(prefix))
         {
+            if trimmed.starts_with('<') && strip_scaffolding(&text).is_none() {
+                return None;
+            }
             continue;
         }
         if text.len() > MAX_WORK_REQUEST_BYTES {
@@ -133,58 +136,195 @@ fn text_content(value: &Value) -> Option<String> {
 }
 
 /// Remove quoted/reference scaffolding without interpreting it as instructions.
-/// Ambiguous XML is discarded. No code, tag payload or quoted label can assign metadata.
+/// Any unfinished or mismatched delimiter withholds the entire request. In
+/// particular, a quote is never reset at a newline to expose quoted instructions.
 pub fn request_text(text: &str) -> Option<String> {
     if text.len() > MAX_WORK_REQUEST_BYTES {
         return None;
     }
+    let stripped = strip_scaffolding(text)?;
     let text = if text.trim_start().starts_with("<in-app-browser-context") {
-        text.rsplit_once("## My request:")?.1
+        stripped.rsplit_once("## My request:")?.1.trim()
     } else {
-        text
+        stripped.trim()
     };
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// Some(empty) means balanced scaffolding without request text. None means
+/// malformed input, and must not allow a later request to become the first.
+fn strip_scaffolding(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
     let mut result = String::new();
-    let mut fence = false;
-    let mut depth = 0usize;
+    let mut tags = Vec::new();
     let mut quote = false;
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            fence = !fence;
-            continue;
-        }
-        if fence || trimmed.starts_with('>') {
-            continue;
-        }
-        let mut chars = line.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch == '<' {
-                let mut tag = String::new();
-                for ch in chars.by_ref() {
-                    if ch == '>' {
-                        break;
-                    }
-                    tag.push(ch);
+    let mut code: Option<usize> = None;
+    let mut fence: Option<(u8, usize)> = None;
+    let mut at = 0;
+    while at < bytes.len() {
+        if (at == 0 || bytes[at - 1] == b'\n') && !quote && code.is_none() {
+            let end = text[at..].find('\n').map_or(bytes.len(), |n| at + n);
+            let line = text[at..end].trim_start();
+            let marker = line.as_bytes().first().copied();
+            let width = line.bytes().take_while(|ch| Some(*ch) == marker).count();
+            if let Some((character, minimum)) = fence {
+                if marker == Some(character) && width >= minimum && line[width..].trim().is_empty()
+                {
+                    fence = None;
                 }
-                if tag.starts_with('/') {
-                    depth = depth.saturating_sub(1);
-                } else if !tag.ends_with('/') {
-                    depth += 1;
-                }
-                result.push(' ');
-            } else if depth == 0 {
-                if ch == '"' || ch == '`' {
-                    quote = !quote;
-                    result.push(' ');
-                } else if !quote {
-                    result.push(ch);
-                }
+                at = (end + 1).min(bytes.len());
+                result.push('\n');
+                continue;
+            }
+            if matches!(marker, Some(b'`' | b'~')) && width >= 3 {
+                fence = Some((marker?, width));
+                at = (end + 1).min(bytes.len());
+                result.push('\n');
+                continue;
+            }
+            if line.starts_with('>') {
+                at = (end + 1).min(bytes.len());
+                result.push('\n');
+                continue;
             }
         }
-        result.push('\n');
+        let ch = text[at..].chars().next()?;
+        if quote {
+            if ch == '\\' {
+                at += ch.len_utf8();
+                // An escaped quote cannot end the reference. A dangling escape
+                // leaves the quote open and is rejected below.
+                if let Some(escaped) = text[at..].chars().next() {
+                    at += escaped.len_utf8();
+                }
+                continue;
+            }
+            if ch == '"' {
+                quote = false;
+            }
+        } else if let Some(width) = code {
+            if ch == '`' {
+                let run = bytes[at..].iter().take_while(|byte| **byte == b'`').count();
+                if run == width {
+                    code = None;
+                }
+                at += run;
+                continue;
+            }
+        } else if ch == '<' {
+            if let Some((tag, width)) = markup(&text[at..]).ok()? {
+                match tag {
+                    Markup::Open(name) => tags.push(name),
+                    Markup::Close(name) => {
+                        if tags.pop() != Some(name) {
+                            return None;
+                        }
+                    }
+                    Markup::Standalone => {}
+                }
+                at += width;
+                result.push(' ');
+                continue;
+            }
+            // Comparisons such as x < y are ordinary request text.
+            if tags.is_empty() {
+                result.push(ch);
+            }
+        } else if tags.is_empty() {
+            match ch {
+                '"' => {
+                    quote = true;
+                    result.push(' ');
+                }
+                '`' => {
+                    let run = bytes[at..].iter().take_while(|byte| **byte == b'`').count();
+                    code = Some(run);
+                    at += run;
+                    result.push(' ');
+                    continue;
+                }
+                _ => result.push(ch),
+            }
+        }
+        at += ch.len_utf8();
     }
-    let text = result.trim();
-    (!text.is_empty()).then(|| text.to_string())
+    if quote || code.is_some() || fence.is_some() || !tags.is_empty() {
+        return None;
+    }
+    Some(result)
+}
+
+enum Markup<'a> {
+    Open(&'a str),
+    Close(&'a str),
+    Standalone,
+}
+
+/// Recognize only tag-shaped openers. This deliberately supports a small
+/// balanced subset, without interpreting declarations, entities or external data.
+fn markup(text: &str) -> Result<Option<(Markup<'_>, usize)>, ()> {
+    let bytes = text.as_bytes();
+    if let Some(comment) = text.strip_prefix("<!--") {
+        let end = comment.find("-->").ok_or(())? + 7;
+        return Ok(Some((Markup::Standalone, end)));
+    }
+    let closing = bytes.get(1) == Some(&b'/');
+    let start = if closing { 2 } else { 1 };
+    if !bytes.get(start).is_some_and(u8::is_ascii_alphabetic) {
+        return if matches!(bytes.get(1), Some(b'!' | b'?' | b'/')) {
+            Err(())
+        } else {
+            Ok(None)
+        };
+    }
+    let mut end = start;
+    while bytes
+        .get(end)
+        .is_some_and(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'_' | b'-' | b':' | b'.'))
+    {
+        end += 1;
+    }
+    let name = &text[start..end];
+    let Some(after_name) = bytes.get(end) else {
+        return Err(()); // An unfinished <context is still ambiguous markup.
+    };
+    if !after_name.is_ascii_whitespace() && !matches!(after_name, b'/' | b'>') {
+        // A name immediately followed by punctuation is not a tag opener:
+        // x<y, for example, is a comparison followed by a clause separator.
+        // A malformed closing tag still signals unmatched scaffolding.
+        return if closing { Err(()) } else { Ok(None) };
+    }
+    let attributes = end;
+    let mut quote = None;
+    while let Some(ch) = bytes.get(end).copied() {
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            }
+        } else {
+            match ch {
+                b'\'' | b'"' => quote = Some(ch),
+                b'<' => return Err(()),
+                b'>' => {
+                    let tail = text[attributes..end].trim();
+                    let tag = if closing {
+                        if !tail.is_empty() {
+                            return Err(());
+                        }
+                        Markup::Close(name)
+                    } else if tail.ends_with('/') {
+                        Markup::Standalone
+                    } else {
+                        Markup::Open(name)
+                    };
+                    return Ok(Some((tag, end + 1)));
+                }
+                _ => {}
+            }
+        }
+        end += 1;
+    }
+    Err(())
 }
 
 #[cfg(test)]
@@ -253,6 +393,78 @@ mod tests {
                 serde_json::json!({"type":"event_msg","payload":{"type":"task_started","started_at":2.0}}),
                 serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"Add the child login screen"}}),
             ].map(|v|v.to_string()).join("\n");
+            assert!(first_user_request("codex", &lines).is_none());
+        }
+    }
+    #[test]
+    fn request_scaffolding_preserves_comparisons_and_balanced_content() {
+        for comparison in [
+            "Fix when x < y, add tests",
+            "Fix when x<y, add tests",
+            "Fix when x<=y, add tests",
+            "Fix when x<y; add tests",
+        ] {
+            assert_eq!(request_text(comparison).as_deref(), Some(comparison));
+        }
+        for request in [
+            "\"security `CI` build\"\nFix the API crash",
+            "\"security\nrefactor\"\nFix the API crash",
+            "\"security \\\"CI\\\" build\"\nFix the API crash",
+            "`security \"CI\" build`\nFix the API crash",
+            "``security `CI` build``\nFix the API crash",
+            "```rust\nsecurity\n~~~\nrefactor\n```\nFix the API crash",
+            "<context reason=\"a > b\"><tags>security</tags></context>\nFix the API crash",
+            "<!-- security > refactor -->\nFix the API crash",
+            "<context\n reason='a > b'><tags /></context>\nFix the API crash",
+        ] {
+            assert_eq!(
+                request_text(request).as_deref(),
+                Some("Fix the API crash"),
+                "{request}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_scaffolding_abstains_on_unbalanced_or_mismatched_delimiters() {
+        let cases = [
+            "Fix the \"login flow. Add a settings page",
+            "Fix the 5\" display",
+            "Fix the API. `security\nAdd tests",
+            "Fix the API. \"security\nAdd tests",
+            "Fix the API. <context>security\nAdd tests",
+            "Fix the API. <context",
+            "Fix the API. <context reason=security",
+            "Fix the API. <context note=\"security>\nAdd tests",
+            "Fix the API. <context>security</other>\nAdd tests",
+            "Fix the API. </context>\nAdd tests",
+            "Fix the API.\n```\nsecurity\n~~~\nAdd tests",
+            "Fix the API. <!-- security\nAdd tests",
+            "Fix the API. ``security`\nAdd tests",
+            "Fix the API.\n~~~~\nsecurity\n~~~\nAdd tests",
+            "<in-app-browser-context>security\n## My request:\nAdd tests",
+        ];
+        let failures = cases
+            .iter()
+            .enumerate()
+            .filter_map(|(index, request)| request_text(request).is_some().then_some(index + 1))
+            .collect::<Vec<_>>();
+        assert!(
+            failures.is_empty(),
+            "malformed cases returned partial input: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn request_scaffolding_failure_never_falls_through_to_later_user_text() {
+        for first in [
+            "Fix the 5\" display",
+            "Fix <context>\nsecurity",
+            "Fix `API",
+            "<system-reminder>security",
+            "<in-app-browser-context>security\n## My request:\nAdd tests",
+        ] {
+            let lines = [first,"Add a login screen"].map(|text|serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":text}}).to_string()).join("\n");
             assert!(first_user_request("codex", &lines).is_none());
         }
     }

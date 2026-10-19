@@ -4707,7 +4707,10 @@ mod tests {
         assert_eq!(session.conversation_id.as_deref(), Some("parent"));
         assert_eq!(session.events.prompts.len(), 1);
         assert_eq!(session.events.prompts[0].preview, "review child result");
-        assert!(session.first_user_request.is_none(), "fork metadata is withheld until ownership is proven");
+        assert!(
+            session.first_user_request.is_none(),
+            "fork metadata is withheld until ownership is proven"
+        );
         assert_eq!(session.events.tools.len(), 1);
         assert_eq!(session.events.tools[0].call_id.as_deref(), Some("owned"));
     }

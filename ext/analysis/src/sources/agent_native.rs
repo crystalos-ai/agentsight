@@ -202,7 +202,7 @@ fn codex_first_request(path: &Path, expected_id: &str) -> Option<String> {
         .components()
         .map(|part| part.as_os_str().to_str())
         .collect::<Vec<_>>();
-    if parts.iter().any(|part| *part == Some(".."))
+    if parts.contains(&Some(".."))
         || !parts.windows(2).any(|parts| {
             parts[0] == Some(".codex") && matches!(parts[1], Some("sessions" | "archived_sessions"))
         })
@@ -243,7 +243,19 @@ fn codex_first_request(path: &Path, expected_id: &str) -> Option<String> {
     ) {
         return None;
     }
-    let content = std::str::from_utf8(&bytes).ok()?;
+    let content = match std::str::from_utf8(&bytes) {
+        Ok(content) => content,
+        // The read cap may split one final character. Trim only that incomplete
+        // sequence, never malformed interior bytes or corruption at the real EOF.
+        Err(error)
+            if error.error_len().is_none()
+                && bytes.len() == agent_session::MAX_WORK_SOURCE_BYTES
+                && before.len() > bytes.len() as u64 =>
+        {
+            std::str::from_utf8(&bytes[..error.valid_up_to()]).ok()?
+        }
+        Err(_) => return None,
+    };
     let metadata: Value = serde_json::from_str(content.lines().next()?).ok()?;
     if metadata.get("type").and_then(Value::as_str) != Some("session_meta")
         || metadata.pointer("/payload/id").and_then(Value::as_str) != Some(expected_id)
@@ -2071,6 +2083,89 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+    fn indexed_codex_first_request_survives_a_utf8_split_at_the_read_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join(".codex/sessions/2026/10/19");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bounded.jsonl");
+        let prefix = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"fixture\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Fix the API bug\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"",
+        );
+        for character in ['é', '€', '🦀'] {
+            for retained_bytes in 1..character.len_utf8() {
+                let padding = agent_session::MAX_WORK_SOURCE_BYTES - prefix.len() - retained_bytes;
+                let source = format!("{prefix}{}{character}\"}}}}\n", "x".repeat(padding));
+                let cut = &source.as_bytes()[..agent_session::MAX_WORK_SOURCE_BYTES];
+                assert!(source.len() > agent_session::MAX_WORK_SOURCE_BYTES);
+                assert!(std::str::from_utf8(cut).unwrap_err().error_len().is_none());
+                fs::write(&path, source).unwrap();
+                let indexed = codex_state_session(
+                    "fixture".into(),
+                    path.to_string_lossy().into(),
+                    None,
+                    0,
+                    Some("Unrelated preview".into()),
+                    None,
+                    None,
+                    None,
+                );
+                assert_eq!(
+                    indexed.first_user_request.as_deref(),
+                    Some("Fix the API bug")
+                );
+                let row = session_row(&indexed);
+                assert_eq!(
+                    row.attributes["session_work"]["categories"],
+                    serde_json::json!(["bug", "fix"])
+                );
+                assert_eq!(
+                    row.attributes["session_work"]["subjects"],
+                    serde_json::json!(["api"])
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn indexed_codex_first_request_refuses_invalid_utf8_inside_the_prefix_or_at_eof() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join(".codex/sessions/2026/10/19");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("invalid.jsonl");
+        let prefix = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"fixture\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Fix the API bug\"}}\n",
+        );
+        let mut interior = prefix.as_bytes().to_vec();
+        interior.push(0xff);
+        interior.resize(agent_session::MAX_WORK_SOURCE_BYTES + 1, b'x');
+        let mut incomplete_eof = prefix.as_bytes().to_vec();
+        incomplete_eof.push(0xc3);
+        let mut capped_incomplete_eof = prefix.as_bytes().to_vec();
+        capped_incomplete_eof.resize(agent_session::MAX_WORK_SOURCE_BYTES - 1, b'x');
+        capped_incomplete_eof.push(0xc3);
+        for source in [interior, incomplete_eof, capped_incomplete_eof] {
+            fs::write(&path, source).unwrap();
+            assert!(codex_first_request(&path, "fixture").is_none());
+            let indexed = codex_state_session(
+                "fixture".into(),
+                path.to_string_lossy().into(),
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+            );
+            assert!(session_row(&indexed).attributes["session_work"].is_null());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn indexed_codex_first_request_requires_native_identity_and_regular_file() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join(".codex/sessions/2026/10/19");
@@ -2080,22 +2175,36 @@ mod tests {
             serde_json::json!({"type":"session_meta","payload":{"id":"fixture"}}),
             serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"Fix the API bug"}}),
         ].map(|v|v.to_string()).join("\n");
-        std::fs::write(&path,source).unwrap();
-        assert_eq!(codex_first_request(&path,"fixture").as_deref(),Some("Fix the API bug"));
-        assert!(codex_first_request(&path,"another-id").is_none());
+        std::fs::write(&path, source).unwrap();
+        assert_eq!(
+            codex_first_request(&path, "fixture").as_deref(),
+            Some("Fix the API bug")
+        );
+        assert!(codex_first_request(&path, "another-id").is_none());
         let link = dir.join("link.jsonl");
-        std::os::unix::fs::symlink(&path,&link).unwrap();
-        assert!(codex_first_request(&link,"fixture").is_none());
-        let indexed = codex_state_session("fixture".into(),path.to_string_lossy().into(),None,0,Some("Security refactor CI from unrelated preview".into()),None,None,None);
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(codex_first_request(&link, "fixture").is_none());
+        let indexed = codex_state_session(
+            "fixture".into(),
+            path.to_string_lossy().into(),
+            None,
+            0,
+            Some("Security refactor CI from unrelated preview".into()),
+            None,
+            None,
+            None,
+        );
         let row = session_row(&indexed);
-        assert_eq!(row.attributes["session_work"]["categories"],serde_json::json!(["bug","fix"]));
+        assert_eq!(
+            row.attributes["session_work"]["categories"],
+            serde_json::json!(["bug", "fix"])
+        );
         std::fs::write(&path, [
             serde_json::json!({"type":"session_meta","payload":{"id":"fixture","parent_thread_id":"parent"}}),
             serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"Fix the parent API bug"}}),
             serde_json::json!({"type":"event_msg","payload":{"type":"task_started","started_at":2.0}}),
             serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"Add a login screen"}}),
         ].map(|v|v.to_string()).join("\n")).unwrap();
-        assert!(codex_first_request(&path,"fixture").is_none());
+        assert!(codex_first_request(&path, "fixture").is_none());
     }
-
 }

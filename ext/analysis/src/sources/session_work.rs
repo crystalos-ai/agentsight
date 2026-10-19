@@ -35,7 +35,6 @@ pub fn classify(request: &str) -> Option<SessionWork> {
             "create",
             "introduce",
             "develop",
-            "support",
             "enable",
         ]);
         let repair = has(&["fix", "repair", "resolve", "correct", "patch"]);
@@ -44,8 +43,14 @@ pub fn classify(request: &str) -> Option<SessionWork> {
             "debug",
             "diagnose",
             "reproduce",
-            "why",
-            "find",
+            "find why",
+            "find out why",
+            "find the cause",
+            "find the root cause",
+            "why does",
+            "why do",
+            "why is",
+            "why are",
         ]);
         let docs = has(&[
             "document",
@@ -55,7 +60,7 @@ pub fn classify(request: &str) -> Option<SessionWork> {
             "update docs",
             "edit docs",
         ]);
-        let tests = (!has(&["run", "execute", "verify", "validate"])
+        let tests = ((!has(&["run", "execute", "verify", "validate"])
             || has(&["write", "add", "create", "fix", "repair", "flaky"]))
             && has(&[
                 "write tests",
@@ -72,7 +77,9 @@ pub fn classify(request: &str) -> Option<SessionWork> {
                 "test harness",
                 "flaky tests",
                 "flaky test",
-            ]);
+            ]))
+            || ((analyze || repair)
+                && has(&["tests fail", "test fails", "failing tests", "failing test"]));
         let ci = has(&[
             "ci",
             "continuous integration",
@@ -140,6 +147,7 @@ pub fn classify(request: &str) -> Option<SessionWork> {
                 "regression",
                 "incorrect",
                 "broken",
+                "fail",
                 "fails",
                 "failing",
                 "defect",
@@ -245,7 +253,15 @@ pub fn classify(request: &str) -> Option<SessionWork> {
             ),
             (
                 S::Api,
-                has(&["api", "endpoint", "endpoints", "rest", "graphql"]),
+                has(&[
+                    "api",
+                    "endpoint",
+                    "endpoints",
+                    "rest service",
+                    "rest services",
+                    "restful",
+                    "graphql",
+                ]),
             ),
             (
                 S::Ui,
@@ -477,6 +493,51 @@ mod tests {
                 .categories,
             vec![C::Docs]
         );
+    }
+
+    #[test]
+    fn ambiguous_reference_words_do_not_invent_work_or_api_subjects() {
+        for text in [
+            "Run the rest of the tests.",
+            "Which operating systems does this package support?",
+            "Find the files that support the failing test.",
+            "Find the explanation of why validation fails for invalid input.",
+        ] {
+            let work = classify(text).unwrap();
+            assert!(work.categories.is_empty(), "{text}: {:?}", work.categories);
+            assert!(!work.subjects.contains(&S::Api), "{text}");
+        }
+    }
+
+    #[test]
+    fn explicit_causal_investigations_and_qualified_features_remain_supported() {
+        let work = classify("Find why the rest of the tests fail.").unwrap();
+        assert_eq!(work.categories, vec![C::Bug, C::Test]);
+        assert_eq!(work.subjects, vec![S::Testing]);
+        for text in [
+            "Why does the API crash on startup?",
+            "Why is login failing?",
+            "Find out why the API crashes.",
+            "Find the root cause of the API crash.",
+            "Find the API bug.",
+            "Investigate failing tests.",
+        ] {
+            assert!(
+                classify(text).unwrap().categories.contains(&C::Bug),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            classify("Add support for OAuth login.").unwrap().categories,
+            vec![C::Feature]
+        );
+        for text in [
+            "Add a REST API.",
+            "Investigate the REST service crash.",
+            "Document the RESTful interface.",
+        ] {
+            assert!(classify(text).unwrap().subjects.contains(&S::Api), "{text}");
+        }
     }
 
     #[test]
