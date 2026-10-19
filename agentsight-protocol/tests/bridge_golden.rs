@@ -678,6 +678,7 @@ fn host_session_vectors() -> Vec<(&'static str, BridgeMessage)> {
                         context_class: Some("claude".to_string()),
                         pid: Some(4242),
                         start_ticks: Some(918_273),
+                        work: None,
                     },
                     HostSessionRow {
                         session_key: "proc:4310:918500".to_string(),
@@ -698,6 +699,7 @@ fn host_session_vectors() -> Vec<(&'static str, BridgeMessage)> {
                         context_class: Some("codex".to_string()),
                         pid: Some(4310),
                         start_ticks: Some(918_500),
+                        work: None,
                     },
                 ],
             },

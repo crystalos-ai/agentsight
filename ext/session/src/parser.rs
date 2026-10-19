@@ -215,13 +215,15 @@ fn parse_session_impl(
     content: &str,
     cursor_children: &[(PathBuf, String)],
 ) -> Option<AgentSession> {
-    if agent == AGENT_GEMINI {
+    let mut session = if agent == AGENT_GEMINI {
         parse_gemini_json(path, updated, content)
     } else if agent == AGENT_CURSOR {
         parse_cursor_jsonl(path, updated, content, cursor_children)
     } else {
         parse_jsonl(agent, path, updated, content)
-    }
+    }?;
+    session.first_user_request = crate::first_user_request(agent, content);
+    Some(session)
 }
 
 /// Extract a session log path from a string (e.g., from /proc/fd).
@@ -1825,6 +1827,7 @@ impl SessionAccumulator {
             tools: self.tools,
             files: self.files,
             prompt_preview: self.prompt_preview,
+            first_user_request: None,
             duration_ms: self.duration_ms,
             cwd: self.cwd,
             last_message_at: self.last_message_at,
@@ -4704,6 +4707,7 @@ mod tests {
         assert_eq!(session.conversation_id.as_deref(), Some("parent"));
         assert_eq!(session.events.prompts.len(), 1);
         assert_eq!(session.events.prompts[0].preview, "review child result");
+        assert!(session.first_user_request.is_none(), "fork metadata is withheld until ownership is proven");
         assert_eq!(session.events.tools.len(), 1);
         assert_eq!(session.events.tools[0].call_id.as_deref(), Some("owned"));
     }

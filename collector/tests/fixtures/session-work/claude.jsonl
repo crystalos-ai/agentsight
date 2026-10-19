@@ -1,0 +1,5 @@
+{"type":"queue-operation","operation":"enqueue","content":"Security refactor CI build, not actual request"}
+{"type":"user","isMeta":true,"message":{"role":"user","content":"<system-reminder>Write tests and documentation</system-reminder>"}}
+{"type":"user","sessionId":"fixture-claude","timestamp":"2026-10-19T10:00:00Z","message":{"role":"user","content":"Add a login screen. Run tests when done. <private>customer-secret-canary</private>"}}
+{"type":"assistant","timestamp":"2026-10-19T10:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test --token=secret-canary"}}]}}
+{"type":"user","timestamp":"2026-10-19T10:00:02Z","message":{"role":"user","content":"Now refactor the API and update documentation"}}

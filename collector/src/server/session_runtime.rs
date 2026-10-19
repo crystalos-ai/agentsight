@@ -1321,6 +1321,7 @@ mod tests {
             model_usage: Default::default(),
             tools: Default::default(),
             files: Default::default(),
+            first_user_request: None,
             prompt_preview: None,
             duration_ms: 0,
             cwd: None,

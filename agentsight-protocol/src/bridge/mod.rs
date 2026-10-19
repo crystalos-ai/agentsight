@@ -13,6 +13,7 @@
 mod annotation;
 mod codec;
 mod host_sessions;
+mod work;
 mod mutation;
 mod rows;
 mod types;
@@ -23,6 +24,7 @@ pub use annotation::{
 };
 pub use codec::{BridgeCodecError, decode_body, encode_body, encode_frame, read_frame};
 pub use host_sessions::HostSessionRow;
+pub use work::{SessionWork, WorkSchema, WorkSource, WorkBasis, WorkMethod, WorkCategory, WorkSubject};
 pub use mutation::{MutationOperation, TimestampBasis, ViewMutation, ViewMutationEnvelope};
 pub use rows::{
     AuditContent, BridgeAuditEventRow, BridgeLlmCallRow, BridgeNetworkTargetRow,

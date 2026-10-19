@@ -119,6 +119,9 @@ fn project_row(
         context_class: context_class(row),
         pid: row.pid,
         start_ticks,
+        work: session
+            .and_then(|session| session.attributes.get("session_work"))
+            .and_then(|value| serde_json::from_value(value.clone()).ok()),
     }
 }
 
@@ -370,5 +373,90 @@ mod tests {
         assert_eq!(projected[0].started_ms, Some(1_760_000_000_000));
         assert_eq!(projected[0].activity_events, Some(3));
         assert_eq!(projected[0].activity_window_s, Some(90));
+    }
+    /// Synthetic native input -> actual parser -> materialized sessions -> bridge projection.
+    /// Set AGENTSIGHT_WORK_FIXTURE_OUTPUT to save this exact wire result for consumer checks.
+    #[test]
+    fn source_fixtures_produce_closed_work_metadata() {
+        use agentsight_protocol::bridge::{BridgeMessage, WorkCategory as C, WorkSubject as S};
+        use std::{path::Path, time::UNIX_EPOCH};
+        let native = [
+            (
+                "claude",
+                include_str!("../../tests/fixtures/session-work/claude.jsonl"),
+            ),
+            (
+                "codex",
+                include_str!("../../tests/fixtures/session-work/codex.jsonl"),
+            ),
+        ]
+        .map(|(agent, content)| {
+            agent_session::parse_session_content(
+                agent,
+                Path::new(&format!("/fixture/{agent}.jsonl")),
+                UNIX_EPOCH,
+                content,
+            )
+            .unwrap()
+        });
+        let view = agentsight_capture::sources::agent_native::materialized_view(&native);
+        let snapshot = view.export_snapshot(crate::model::SnapshotOptions { audit_limit: 0 });
+        let top = snapshot
+            .sessions
+            .iter()
+            .map(|session| AgentTopRow {
+                session: display_key(session).to_string(),
+                session_id: session
+                    .attributes
+                    .get("session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                agent: session.agent_type.clone(),
+                trace: "agent-native".to_string(),
+                command: "security CI build --secret=command-canary".to_string(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let rows = project_rows(&top, &snapshot, None, 1_792_404_000_000);
+        let claude = rows
+            .iter()
+            .find(|row| row.agent_kind == "claude")
+            .unwrap()
+            .work
+            .as_ref()
+            .unwrap();
+        assert_eq!(claude.categories, vec![C::Feature]);
+        assert_eq!(claude.subjects, vec![S::Authentication, S::Ui]);
+        let codex = rows
+            .iter()
+            .find(|row| row.agent_kind == "codex")
+            .unwrap()
+            .work
+            .as_ref()
+            .unwrap();
+        assert_eq!(codex.categories, vec![C::Bug, C::Fix, C::Test]);
+        assert_eq!(codex.subjects, vec![S::Api, S::Testing]);
+        let message = BridgeMessage::HostSessionsSnapshot {
+            generated_ms: 1_792_404_000_000,
+            sessions: rows,
+        };
+        let json = serde_json::to_string_pretty(&message).unwrap();
+        for forbidden in [
+            "secret-canary",
+            "command-canary",
+            "login screen",
+            "API bug",
+            "AGENTS.md",
+            "regression tests",
+            "first_user_request\": \"Add",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "source text escaped the metadata projection"
+            );
+        }
+        if let Some(output) = std::env::var_os("AGENTSIGHT_WORK_FIXTURE_OUTPUT") {
+            std::fs::write(output, json).unwrap();
+        }
     }
 }

@@ -192,6 +192,9 @@ pub struct AgentSession {
     pub tools: BTreeMap<String, usize>,
     pub files: BTreeMap<String, usize>,
     pub prompt_preview: Option<String>,
+    /// Local, bounded native first request; never serialized into session APIs.
+    #[serde(skip)]
+    pub first_user_request: Option<String>,
     pub duration_ms: u64,
     pub cwd: Option<String>,
     pub last_message_at: Option<String>,

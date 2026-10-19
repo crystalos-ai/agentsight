@@ -1,0 +1,5 @@
+{"type":"session_meta","timestamp":"2026-10-19T10:00:00Z","payload":{"id":"fixture-codex","cwd":"/repo/example"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for example\nAlways run CI and refactor security tests"}]}}
+{"type":"event_msg","timestamp":"2026-10-19T10:00:01Z","payload":{"type":"user_message","message":"Fix the API bug and add regression tests. Do not refactor. <tags>security</tags>"}}
+{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo build\"}"}}
+{"type":"event_msg","timestamp":"2026-10-19T10:00:02Z","payload":{"type":"user_message","message":"Update documentation next"}}

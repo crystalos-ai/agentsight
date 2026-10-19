@@ -747,6 +747,7 @@ mod tests {
             model_usage: BTreeMap::new(),
             tools: BTreeMap::new(),
             files: BTreeMap::new(),
+            first_user_request: None,
             prompt_preview: None,
             duration_ms: 0,
             cwd: Some("/repo".into()),

@@ -60,6 +60,13 @@ pub struct HostSessionRow {
     /// Kernel process start time in clock ticks, the other half of the identity
     /// that survives pid reuse.
     pub start_ticks: Option<u64>,
+    /// Suggested first-request metadata. Missing is unknown, never Chore.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::work::deserialize_optional"
+    )]
+    pub work: Option<super::SessionWork>,
 }
 
 impl HostSessionRow {
@@ -103,6 +110,7 @@ mod tests {
             context_class: Some("claude".to_string()),
             pid: Some(4242),
             start_ticks: Some(918_273),
+            work: None,
         }
     }
 

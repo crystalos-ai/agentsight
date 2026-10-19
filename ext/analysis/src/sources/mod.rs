@@ -4,3 +4,4 @@
 pub use agentsight_capture_core::sources::proc;
 pub mod agent_native;
 pub mod sqlite;
+pub mod session_work;
