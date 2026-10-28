@@ -2188,14 +2188,22 @@ fn extract_tool_paths(name: &str, input: &Value, command: &str, effect: &str) ->
     }
 
     if is_shell && !has_patch {
-        for (path, access, previous_path) in shell_file_actions(command, input, 0) {
+        let mut room = MAX_JOINED_PATH_BYTES;
+        for (path, access, previous_path) in shell_file_actions(command, input, 0, &mut room) {
             rows.insert(path, (access, previous_path));
         }
         for nested in embedded_json_objects(command, "tools.exec_command(") {
             let nested_command = command_from_tool_input(&nested);
-            for (path, access, previous_path) in shell_file_actions(&nested_command, &nested, 0) {
+            for (path, access, previous_path) in
+                shell_file_actions(&nested_command, &nested, 0, &mut room)
+            {
                 rows.insert(path, (access, previous_path));
             }
+        }
+        if room == 0 {
+            log::warn!(
+                "a {name} call's paths passed {MAX_JOINED_PATH_BYTES} bytes joined to their directory; the rest stay relative"
+            );
         }
     }
     rows.into_iter()
@@ -2265,6 +2273,7 @@ fn shell_file_actions(
     command: &str,
     input: &Value,
     depth: usize,
+    room: &mut usize,
 ) -> Vec<(String, String, Option<String>)> {
     if depth > 2 {
         return Vec::new();
@@ -2287,18 +2296,18 @@ fn shell_file_actions(
                 cwd = Some(if is_absolute_path_text(path) {
                     normalize_path_text(path)
                 } else {
-                    join_path_text(cwd.as_deref().unwrap_or_default(), path)
+                    join_within(room, cwd.as_deref().unwrap_or_default(), path)
                 });
             }
             continue;
         }
-        let mut actions = shell_segment_actions(&name, operands, input, depth);
+        let mut actions = shell_segment_actions(&name, operands, input, depth, room);
         for (path, _, previous_path) in &mut actions {
             if !path.starts_with(['~', '$'])
                 && !is_absolute_path_text(path)
                 && let Some(base) = &cwd
             {
-                *path = join_path_text(base, path);
+                *path = join_within(room, base, path);
             }
             *path = clean_path_token(path);
             if let Some(previous) = previous_path {
@@ -2306,7 +2315,7 @@ fn shell_file_actions(
                     && !is_absolute_path_text(previous)
                     && let Some(base) = &cwd
                 {
-                    *previous = join_path_text(base, previous);
+                    *previous = join_within(room, base, previous);
                 }
                 *previous = clean_path_token(previous);
             }
@@ -2321,6 +2330,7 @@ fn shell_segment_actions(
     operands: &[String],
     input: &Value,
     depth: usize,
+    room: &mut usize,
 ) -> Vec<(String, String, Option<String>)> {
     let mut rows = Vec::new();
     let mut values = Vec::new();
@@ -2357,7 +2367,7 @@ fn shell_segment_actions(
         "bash" | "sh" | "zsh" => {
             for index in 0..values.len().saturating_sub(1) {
                 if ["-c", "-lc", "-cl"].contains(&values[index].as_str()) {
-                    rows.extend(shell_file_actions(&values[index + 1], input, depth + 1));
+                    rows.extend(shell_file_actions(&values[index + 1], input, depth + 1, room));
                     break;
                 }
             }
@@ -2367,7 +2377,7 @@ fn shell_segment_actions(
             if let Some((target, sources)) = paths.split_last() {
                 for source in sources {
                     rows.push((source.clone(), "read".into(), None));
-                    let destination = destination_path(target, source, sources.len() > 1);
+                    let destination = destination_path(target, source, sources.len() > 1, room);
                     rows.push((destination, "create".into(), None));
                 }
             }
@@ -2377,7 +2387,7 @@ fn shell_segment_actions(
             if let Some((target, sources)) = paths.split_last() {
                 for source in sources {
                     rows.push((
-                        destination_path(target, source, sources.len() > 1),
+                        destination_path(target, source, sources.len() > 1, room),
                         "rename".into(),
                         Some(source.clone()),
                     ));
@@ -2450,9 +2460,9 @@ fn shell_segment_actions(
     rows
 }
 
-fn destination_path(target: &str, source: &str, multiple: bool) -> String {
+fn destination_path(target: &str, source: &str, multiple: bool, room: &mut usize) -> String {
     if multiple || target.ends_with(['/', '\\']) {
-        join_path_text(target, path_basename(source))
+        join_within(room, target, path_basename(source))
     } else {
         normalize_path_text(target)
     }
@@ -2466,6 +2476,27 @@ fn is_absolute_path_text(path: &str) -> bool {
     let path = normalize_path_text(path);
     path.starts_with('/')
         || path.as_bytes().get(1) == Some(&b':') && path.as_bytes().get(2) == Some(&b'/')
+}
+
+/// The most bytes one tool call's paths may gain from being joined to a
+/// directory. `cd`, `workdir` and a `cp` or `mv` target set one, and each
+/// relative path copies it, so one command could build its directory's length
+/// times its paths before the parse counts the event ([`Built`]).
+const MAX_JOINED_PATH_BYTES: usize = 1024 * 1024;
+
+/// `base` joined to `child`, paid for out of `room`. Past it, `child` stays
+/// relative, and so does every later path of the call.
+fn join_within(room: &mut usize, base: &str, child: &str) -> String {
+    match room.checked_sub(base.len() + child.len()) {
+        Some(left) => {
+            *room = left;
+            join_path_text(base, child)
+        }
+        None => {
+            *room = 0;
+            normalize_path_text(child)
+        }
+    }
 }
 
 fn join_path_text(base: &str, child: &str) -> String {
@@ -3918,6 +3949,7 @@ mod tests {
     /// under the window can build hundreds of MiB (Sol r3: a 200 KiB model,
     /// measured at 314 MiB). Such a parse stops at the cache's budget and gives
     /// no session; an honest file still parses.
+    #[cfg(unix)]
     #[test]
     fn a_file_that_builds_past_the_budget_gives_no_session() {
         let home = scratch("agentsight-built");
@@ -5005,10 +5037,29 @@ mod tests {
         assert_eq!(heredoc.paths[0].path, "src/real.rs");
     }
 
+    /// One call names a 200 KiB directory and 1,000 relative paths (Sol r4:
+    /// 223 MB before its event was counted). Joined paths gain at most
+    /// MAX_JOINED_PATH_BYTES; past it they stay relative.
+    #[test]
+    fn a_long_directory_joined_to_many_paths_stays_within_the_call_allowance() {
+        let dir = format!("/{}", "d".repeat(200 * 1024));
+        let names: String = (0..1000).map(|n| format!(" f{n}.rs")).collect();
+        for (input, command) in [
+            (json!({"command": format!("cat{names}"), "workdir": dir}), format!("cat{names}")),
+            (json!({}), format!("cd {dir} && cat{names}")),
+            (json!({}), format!("cp{names} {dir}/")),
+        ] {
+            let paths = extract_tool_paths("Bash", &input, &command, "");
+            let bytes: usize = paths.iter().map(|path| path.path.len()).sum();
+            assert!(paths.len() >= 1000, "{}", paths.len());
+            assert!(bytes <= MAX_JOINED_PATH_BYTES + 2 * command.len(), "{bytes} bytes");
+        }
+    }
+
     #[test]
     fn shell_path_operands_are_not_limited_to_known_extensions() {
         let paths_of = |command: &str| {
-            shell_file_actions(command, &json!({"cwd": "/repo"}), 0)
+            shell_file_actions(command, &json!({"cwd": "/repo"}), 0, &mut MAX_JOINED_PATH_BYTES.clone())
                 .into_iter()
                 .map(|(path, access, _)| (path, access))
                 .collect::<Vec<_>>()
