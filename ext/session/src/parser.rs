@@ -7,7 +7,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -177,15 +177,17 @@ pub fn session_candidate_from_path(path: &Path) -> Option<SessionCandidate> {
     })
 }
 
-/// The most of one session file a parser reads. A session folder can be
-/// writable by a workload the collector watches, and the collector has a fixed
-/// memory limit; a longer file is read up to its last whole line within this.
-const MAX_SESSION_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// The most of one session file a parser reads. Parsing costs up to about 19
+/// times its input (one line of a JSON array of small numbers), a session
+/// folder can be writable by a workload the collector watches, and the
+/// collector has a fixed memory limit. A longer file is read from its end, so
+/// the newest turns stay visible.
+const MAX_SESSION_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Read a session file: a regular file only, opened without following a link
 /// at its name or blocking on a FIFO, and checked on the open file, so a swap
-/// after discovery cannot change what is read. At most
-/// [`MAX_SESSION_FILE_BYTES`].
+/// after discovery cannot change what is read. A file over
+/// [`MAX_SESSION_FILE_BYTES`] is read as its last whole lines within that.
 fn read_session_file(path: &Path) -> io::Result<String> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -194,27 +196,32 @@ fn read_session_file(path: &Path) -> io::Result<String> {
         &mut options,
         libc::O_NOFOLLOW | libc::O_NONBLOCK,
     );
-    let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
+    let mut file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{} is not a regular file", path.display()),
         ));
     }
-    let mut bytes = Vec::new();
-    file.take(MAX_SESSION_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_SESSION_FILE_BYTES {
-        log::warn!(
-            "session file {} is over {MAX_SESSION_FILE_BYTES} bytes; reading its whole lines up to that",
-            path.display()
+    let tail = meta.len() > MAX_SESSION_FILE_BYTES;
+    if tail {
+        log::debug!(
+            "session file {} is {} bytes; reading its last {MAX_SESSION_FILE_BYTES}",
+            path.display(),
+            meta.len()
         );
-        bytes.truncate(MAX_SESSION_FILE_BYTES as usize);
-        let whole = bytes
+        file.seek(SeekFrom::Start(meta.len() - MAX_SESSION_FILE_BYTES))?;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_SESSION_FILE_BYTES).read_to_end(&mut bytes)?;
+    if tail {
+        // The window starts inside a line: drop that part.
+        let first = bytes
             .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |end| end + 1);
-        bytes.truncate(whole);
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len(), |end| end + 1);
+        bytes.drain(..first);
     }
     String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
@@ -3811,25 +3818,31 @@ mod tests {
         fs::remove_dir_all(home).expect("remove scratch directory");
     }
 
-    /// A scan of a folder with a FIFO and a sparse file past the cap finishes,
-    /// and reads no more than the cap of the sparse file.
+    /// A scan finishes past a FIFO. A file over the cap is read as its newest
+    /// whole lines, at most the cap: a session after a long hole parses, and
+    /// one line longer than the cap gives nothing.
     #[cfg(unix)]
     #[test]
-    fn a_scan_finishes_past_a_fifo_and_an_oversized_sparse_file() {
-        use std::io::{Seek, SeekFrom, Write};
+    fn a_scan_finishes_past_a_fifo_and_reads_at_most_the_end_of_a_long_file() {
+        use std::io::Write;
         let home = scratch("agentsight-scan");
         let project = home.join(".claude/projects/-w");
         fs::create_dir_all(&project).expect("project");
         fs::write(project.join("real.jsonl"), CLAUDE_SESSION).expect("real session");
         mkfifo(&project.join("fifo.jsonl"));
-        // A hole past the cap, then a whole session the cap leaves unread.
-        let mut sparse = fs::File::create(project.join("sparse.jsonl")).expect("sparse file");
-        sparse
+        let long = project.join("long.jsonl");
+        fs::File::create(&long)
+            .expect("long file")
             .set_len(2 * MAX_SESSION_FILE_BYTES)
-            .expect("make the hole");
-        sparse.seek(SeekFrom::End(0)).expect("seek past the hole");
-        write!(sparse, "\n{CLAUDE_SESSION}").expect("session past the cap");
-        drop(sparse);
+            .expect("one long line");
+        let huge = project.join("huge.jsonl");
+        fs::copy(&long, &huge).expect("a line longer than the cap");
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&long)
+            .expect("append");
+        write!(file, "\n{CLAUDE_SESSION}").expect("the newest session lines");
+        drop(file);
 
         let (done, finished) = std::sync::mpsc::channel();
         let scanned = home.clone();
@@ -3844,13 +3857,12 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("the scan blocked on a session file");
 
-        assert_eq!(sessions, 1, "only the real session parses");
-        assert!(
-            read_session_file(&project.join("sparse.jsonl"))
-                .expect("read the sparse file")
-                .is_empty(),
-            "no whole line within the cap"
+        assert_eq!(sessions, 2, "the real session and the long file's end");
+        assert_eq!(
+            read_session_file(&long).expect("read the long file"),
+            CLAUDE_SESSION
         );
+        assert_eq!(read_session_file(&huge).expect("read the huge line"), "");
         fs::remove_dir_all(home).expect("remove scratch directory");
     }
 
