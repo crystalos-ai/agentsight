@@ -7,6 +7,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -176,9 +177,51 @@ pub fn session_candidate_from_path(path: &Path) -> Option<SessionCandidate> {
     })
 }
 
+/// The most of one session file a parser reads. A session folder can be
+/// writable by a workload the collector watches, and the collector has a fixed
+/// memory limit; a longer file is read up to its last whole line within this.
+const MAX_SESSION_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read a session file: a regular file only, opened without following a link
+/// at its name or blocking on a FIFO, and checked on the open file, so a swap
+/// after discovery cannot change what is read. At most
+/// [`MAX_SESSION_FILE_BYTES`].
+fn read_session_file(path: &Path) -> io::Result<String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    );
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_SESSION_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SESSION_FILE_BYTES {
+        log::warn!(
+            "session file {} is over {MAX_SESSION_FILE_BYTES} bytes; reading its whole lines up to that",
+            path.display()
+        );
+        bytes.truncate(MAX_SESSION_FILE_BYTES as usize);
+        let whole = bytes
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |end| end + 1);
+        bytes.truncate(whole);
+    }
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
 /// Parse a session file from a candidate.
 pub fn parse_session_file(candidate: &SessionCandidate) -> Option<AgentSession> {
-    let content = fs::read_to_string(&candidate.path).ok()?;
+    let content = read_session_file(&candidate.path).ok()?;
     let cursor_children = if candidate.agent == AGENT_CURSOR {
         read_cursor_subagents(&candidate.path)
     } else {
@@ -1337,7 +1380,7 @@ fn read_cursor_subagents(path: &Path) -> Vec<(PathBuf, String)> {
         .map(|entry| entry.path())
         .filter(|child| child.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
         .filter_map(|child| {
-            let content = fs::read_to_string(&child).ok()?;
+            let content = read_session_file(&child).ok()?;
             Some((child, content))
         })
         .collect();
@@ -1850,12 +1893,23 @@ fn walk_agent_files(agent: &'static str, dir: &Path, f: &mut dyn FnMut(&Path, &f
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        // Without following links (`DirEntry::metadata`): a session folder can
+        // be writable by a workload the collector watches, which could plant a
+        // link to a device, a FIFO or a directory loop.
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
             walk_agent_files(agent, &path, f);
-        } else if is_agent_file_for(agent, &path)
-            && let Ok(meta) = path.metadata()
-        {
-            f(&path, &meta);
+        } else if is_agent_file_for(agent, &path) {
+            if meta.is_file() {
+                f(&path, &meta);
+            } else {
+                log::warn!(
+                    "skipping session file {}: not a regular file",
+                    path.display()
+                );
+            }
         }
     }
 }
@@ -3701,6 +3755,121 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    fn scratch(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{name}-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create scratch directory");
+        dir
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo {path:?}");
+    }
+
+    #[cfg(unix)]
+    const CLAUDE_SESSION: &str = concat!(
+        r#"{"type":"user","message":{"content":"review the paper"}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"model":"claude-opus","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":10,"output_tokens":1}}}"#,
+        "\n"
+    );
+
+    /// A session folder a workload can write holds a link to a device, a FIFO,
+    /// a link to a directory and a directory loop: only the real session is
+    /// discovered.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_finds_only_regular_session_files_and_follows_no_link() {
+        let home = scratch("agentsight-walk");
+        let projects = home.join(".claude/projects");
+        let real = projects.join("-real");
+        let hostile = projects.join("-hostile");
+        fs::create_dir_all(&real).expect("real project");
+        fs::create_dir_all(&hostile).expect("hostile project");
+        fs::write(real.join("s.jsonl"), CLAUDE_SESSION).expect("real session");
+        std::os::unix::fs::symlink("/dev/zero", hostile.join("zero.jsonl")).expect("device link");
+        mkfifo(&hostile.join("fifo.jsonl"));
+        std::os::unix::fs::symlink(&real, hostile.join("linked")).expect("directory link");
+        std::os::unix::fs::symlink("..", hostile.join("loop")).expect("directory loop");
+
+        let found: Vec<PathBuf> = discover_session_files_in_home(&home)
+            .into_iter()
+            .map(|candidate| candidate.path)
+            .collect();
+
+        assert_eq!(found, [real.join("s.jsonl")]);
+        fs::remove_dir_all(home).expect("remove scratch directory");
+    }
+
+    /// A scan of a folder with a FIFO and a sparse file past the cap finishes,
+    /// and reads no more than the cap of the sparse file.
+    #[cfg(unix)]
+    #[test]
+    fn a_scan_finishes_past_a_fifo_and_an_oversized_sparse_file() {
+        use std::io::{Seek, SeekFrom, Write};
+        let home = scratch("agentsight-scan");
+        let project = home.join(".claude/projects/-w");
+        fs::create_dir_all(&project).expect("project");
+        fs::write(project.join("real.jsonl"), CLAUDE_SESSION).expect("real session");
+        mkfifo(&project.join("fifo.jsonl"));
+        // A hole past the cap, then a whole session the cap leaves unread.
+        let mut sparse = fs::File::create(project.join("sparse.jsonl")).expect("sparse file");
+        sparse
+            .set_len(2 * MAX_SESSION_FILE_BYTES)
+            .expect("make the hole");
+        sparse.seek(SeekFrom::End(0)).expect("seek past the hole");
+        write!(sparse, "\n{CLAUDE_SESSION}").expect("session past the cap");
+        drop(sparse);
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let scanned = home.clone();
+        std::thread::spawn(move || {
+            let sessions = discover_session_files_in_home(&scanned)
+                .iter()
+                .filter_map(parse_session_file)
+                .count();
+            done.send(sessions).expect("report the scan");
+        });
+        let sessions = finished
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the scan blocked on a session file");
+
+        assert_eq!(sessions, 1, "only the real session parses");
+        assert!(
+            read_session_file(&project.join("sparse.jsonl"))
+                .expect("read the sparse file")
+                .is_empty(),
+            "no whole line within the cap"
+        );
+        fs::remove_dir_all(home).expect("remove scratch directory");
+    }
+
+    /// The read itself opens only a regular file, whatever discovery saw: not
+    /// through a link, not a FIFO (without blocking), not a device.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_read_opens_only_a_regular_file() {
+        let dir = scratch("agentsight-read");
+        let zero = dir.join("zero.jsonl");
+        let fifo = dir.join("fifo.jsonl");
+        std::os::unix::fs::symlink("/dev/zero", &zero).expect("device link");
+        mkfifo(&fifo);
+
+        for path in [zero.as_path(), fifo.as_path(), Path::new("/dev/zero")] {
+            assert!(read_session_file(path).is_err(), "{path:?}");
+        }
+        fs::remove_dir_all(dir).expect("remove scratch directory");
+    }
 
     // A parent transcript that both delegates and works directly, since Cursor mixes both.
     fn cursor_parent_fixture() -> String {

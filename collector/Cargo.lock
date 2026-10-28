@@ -21,6 +21,8 @@ dependencies = [
  "chrono",
  "dirs",
  "hex",
+ "libc",
+ "log 0.4.33",
  "serde",
  "serde_json",
  "sha2 0.10.9",
