@@ -5044,10 +5044,13 @@ mod tests {
     fn a_long_directory_joined_to_many_paths_stays_within_the_call_allowance() {
         let dir = format!("/{}", "d".repeat(200 * 1024));
         let names: String = (0..1000).map(|n| format!(" f{n}.rs")).collect();
+        // A `cp` target past 140 bytes is no path, so a short one takes many sources.
+        let target = format!("/{}/", "d".repeat(130));
+        let sources: String = (0..20_000).map(|n| format!(" f{n}.rs")).collect();
         for (input, command) in [
             (json!({"command": format!("cat{names}"), "workdir": dir}), format!("cat{names}")),
             (json!({}), format!("cd {dir} && cat{names}")),
-            (json!({}), format!("cp{names} {dir}/")),
+            (json!({}), format!("cp{sources} {target}")),
         ] {
             let paths = extract_tool_paths("Bash", &input, &command, "");
             let bytes: usize = paths.iter().map(|path| path.path.len()).sum();
