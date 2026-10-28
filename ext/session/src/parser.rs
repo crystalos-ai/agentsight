@@ -182,7 +182,7 @@ pub fn session_candidate_from_path(path: &Path) -> Option<SessionCandidate> {
 /// can be writable by a workload the collector watches, and the collector has
 /// a fixed memory limit. A longer file is read from its end, so the newest
 /// turns stay visible.
-const MAX_SESSION_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_SESSION_FILE_BYTES: u64 = 512 * 1024;
 
 /// Read a session file: a regular file only, opened without following a link
 /// at its name or blocking on a FIFO, and checked on the open file, so a swap
