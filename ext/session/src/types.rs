@@ -16,7 +16,7 @@ use crate::{discover_session_files, parse_session_file};
 /// naming many paths) gives about five times its bytes, takes about three
 /// times that in memory, and is kept in up to three copies. A session past the
 /// budget is dropped until its file changes.
-const MAX_CACHED_SESSION_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_CACHED_SESSION_BYTES: usize = 8 * 1024 * 1024;
 
 /// Token usage statistics for a model or session.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -248,9 +248,7 @@ impl CacheEntry {
         let session = parse_session_file(candidate);
         // Only a modification time before 1970 fails to serialize; such a
         // session cannot fit.
-        let bytes = session.as_ref().map_or(0, |session| {
-            serde_json::to_vec(session).map_or(usize::MAX, |json| json.len())
-        });
+        let bytes = session.as_ref().map_or(0, crate::parser::json_len);
         Self {
             mtime: candidate.updated,
             session,

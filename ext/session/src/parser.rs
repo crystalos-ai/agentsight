@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::types::{
-    AgentSession, LlmResponse, PlanStep, SessionCandidate, SessionDirStat, SessionEvents,
-    TokenUsage, ToolEvent, ToolPath, UserPrompt,
+    AgentSession, LlmResponse, MAX_CACHED_SESSION_BYTES, PlanStep, SessionCandidate,
+    SessionDirStat, SessionEvents, TokenUsage, ToolEvent, ToolPath, UserPrompt,
 };
 use crate::{AGENT_CLAUDE, AGENT_CODEX, AGENT_CURSOR, AGENT_GEMINI};
 
@@ -183,6 +183,40 @@ pub fn session_candidate_from_path(path: &Path) -> Option<SessionCandidate> {
 /// a fixed memory limit. A longer file is read from its end, so the newest
 /// turns stay visible.
 const MAX_SESSION_FILE_BYTES: u64 = 512 * 1024;
+
+/// What one parse has built, as JSON bytes, counted as each event is added.
+/// The window bounds the file, not what parsing builds from it: a value one
+/// line sets (a model, a skill, a task) is copied into every later event, so a
+/// file well under the window could build hundreds of MiB. A parse stops, with
+/// no session, once it passes the session cache's budget: the cache could never
+/// keep that session.
+#[derive(Default)]
+struct Built(usize);
+
+impl Built {
+    /// Add `event` to `events`, or `None` once the parse is over the budget.
+    fn push<T: serde::Serialize>(&mut self, events: &mut Vec<T>, event: T) -> Option<()> {
+        self.0 = self.0.saturating_add(json_len(&event));
+        (self.0 <= MAX_CACHED_SESSION_BYTES).then(|| events.push(event))
+    }
+}
+
+/// The length of `value` as JSON, counted without building it; `usize::MAX`
+/// when it cannot be serialized.
+pub(crate) fn json_len(value: &impl serde::Serialize) -> usize {
+    struct Count(usize);
+    impl io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value).map_or(usize::MAX, |()| count.0)
+}
 
 /// Read a session file: a regular file only, opened without following a link
 /// at its name or blocking on a FIFO, and checked on the open file, so a swap
@@ -574,6 +608,7 @@ fn parse_jsonl(
     let mut claude_message_models = BTreeMap::<String, TokenUsage>::new();
     let mut claude_seen_usage = HashSet::new();
     let mut events = SessionEvents::default();
+    let mut built = Built::default();
     let mut current_prompt_index = 0usize;
     let mut call_index = BTreeMap::<String, usize>::new();
     let mut task_stack = SemanticTaskStack::default();
@@ -757,7 +792,7 @@ fn parse_jsonl(
                         if let Some(id) = call_id {
                             call_index.insert(id, events.tools.len());
                         }
-                        events.tools.push(event);
+                        built.push(&mut events.tools, event)?;
                     }
                 }
                 let text = content_to_text(content);
@@ -785,7 +820,7 @@ fn parse_jsonl(
                     } else {
                         String::new()
                     };
-                    events.llm_responses.push(LlmResponse {
+                    built.push(&mut events.llm_responses, LlmResponse {
                         ts_ms: ts_ms_from_event(&obj),
                         prompt_index: current_prompt_index,
                         model,
@@ -818,7 +853,7 @@ fn parse_jsonl(
                         },
                         skill: response_skill,
                         task_path: task_stack.path(),
-                    });
+                    })?;
                 }
             }
             (AGENT_CLAUDE, "queue-operation") if acc.prompt_preview.is_none() => {
@@ -829,7 +864,7 @@ fn parse_jsonl(
                     acc.prompt_preview = Some(truncate_clean(&text, 180));
                     task_stack.observe_user(&text);
                     current_prompt_index =
-                        events.upsert_prompt(ts_ms_from_event(&obj), &text, task_stack.path());
+                        events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path())?;
                 }
             }
             (AGENT_CLAUDE, "last-prompt") if acc.prompt_preview.is_none() => {
@@ -839,7 +874,7 @@ fn parse_jsonl(
                     acc.prompt_preview = Some(truncate_clean(&text, 180));
                     task_stack.observe_user(&text);
                     current_prompt_index =
-                        events.upsert_prompt(ts_ms_from_event(&obj), &text, task_stack.path());
+                        events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path())?;
                 }
             }
             (AGENT_CLAUDE, "user") => {
@@ -877,7 +912,7 @@ fn parse_jsonl(
                         .filter(|value| !value.is_empty())
                         .map(str::to_string);
                     current_prompt_index =
-                        events.upsert_prompt(ts_ms_from_event(&obj), &text, task_stack.path());
+                        events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path())?;
                 }
             }
             (AGENT_CODEX, "turn_context") => {
@@ -942,7 +977,7 @@ fn parse_jsonl(
                         acc.prompt_preview = Some(truncate_clean(&text, 180));
                         task_stack.observe_user(&text);
                         current_prompt_index =
-                            events.upsert_prompt(ts_ms_from_event(&obj), &text, task_stack.path());
+                            events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path())?;
                     }
                 }
                 if ptype == "agent_message" {
@@ -952,7 +987,7 @@ fn parse_jsonl(
                         .and_then(Value::as_str)
                         .unwrap_or("");
                     if let Some(text) = clean_prompt_text(text) {
-                        events.llm_responses.push(LlmResponse {
+                        built.push(&mut events.llm_responses, LlmResponse {
                             ts_ms: ts_ms_from_event(&obj),
                             prompt_index: current_prompt_index,
                             model: if codex_model.is_empty() {
@@ -976,7 +1011,7 @@ fn parse_jsonl(
                                 .to_string(),
                             skill: String::new(),
                             task_path: task_stack.path(),
-                        });
+                        })?;
                     }
                 }
             }
@@ -1011,7 +1046,7 @@ fn parse_jsonl(
                 if let Some(id) = call_id {
                     call_index.insert(id, events.tools.len());
                 }
-                events.tools.push(event);
+                built.push(&mut events.tools, event)?;
             }
             (AGENT_CODEX, "response_item")
                 if obj.pointer("/payload/type").and_then(Value::as_str)
@@ -1056,7 +1091,7 @@ fn parse_jsonl(
                 if let Some(id) = call_id {
                     call_index.insert(id, events.tools.len());
                 }
-                events.tools.push(event);
+                built.push(&mut events.tools, event)?;
             }
             (AGENT_CODEX, "response_item")
                 if obj.pointer("/payload/type").and_then(Value::as_str)
@@ -1089,7 +1124,7 @@ fn parse_jsonl(
                         acc.prompt_preview = Some(truncate_clean(&text, 180));
                         task_stack.observe_user(&text);
                         current_prompt_index =
-                            events.upsert_prompt(ts_ms_from_event(&obj), &text, task_stack.path());
+                            events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path())?;
                         continue;
                     }
                     let role = payload.get("role").and_then(Value::as_str);
@@ -1105,7 +1140,7 @@ fn parse_jsonl(
                     if role != Some("assistant") && !legacy_assistant {
                         continue;
                     }
-                    events.llm_responses.push(LlmResponse {
+                    built.push(&mut events.llm_responses, LlmResponse {
                         ts_ms: ts_ms_from_event(&obj),
                         prompt_index: current_prompt_index,
                         model: if codex_model.is_empty() {
@@ -1129,7 +1164,7 @@ fn parse_jsonl(
                             .to_string(),
                         skill: String::new(),
                         task_path: task_stack.path(),
-                    });
+                    })?;
                 }
             }
             (AGENT_CODEX, "message" | "input" | "user") => {
@@ -1137,7 +1172,7 @@ fn parse_jsonl(
                     acc.prompt_preview = Some(truncate_clean(&text, 180));
                     task_stack.observe_user(&text);
                     current_prompt_index =
-                        events.upsert_prompt(ts_ms_from_event(&obj), &text, task_stack.path());
+                        events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path())?;
                 }
             }
             _ if acc.prompt_preview.is_none() && typ.contains("user") => {
@@ -1145,7 +1180,7 @@ fn parse_jsonl(
                     acc.prompt_preview = Some(truncate_clean(&text, 180));
                     task_stack.observe_user(&text);
                     current_prompt_index =
-                        events.upsert_prompt(ts_ms_from_event(&obj), &text, task_stack.path());
+                        events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path())?;
                 }
             }
             _ => {}
@@ -1227,6 +1262,7 @@ fn parse_gemini_json(path: &Path, updated: SystemTime, content: &str) -> Option<
     let root: Value = serde_json::from_str(content).ok()?;
     let mut acc = SessionAccumulator::new(AGENT_GEMINI, path, updated);
     let mut events = SessionEvents::default();
+    let mut built = Built::default();
     let mut current_prompt_index = 0usize;
     let mut task_stack = SemanticTaskStack::default();
     if let Some(id) = root.get("sessionId").and_then(Value::as_str) {
@@ -1264,13 +1300,13 @@ fn parse_gemini_json(path: &Path, updated: SystemTime, content: &str) -> Option<
                 if let Some(text) = local_message_preview(msg.get("content").unwrap_or(msg)) {
                     acc.prompt_preview = Some(truncate_clean(&text, 180));
                     task_stack.observe_user(&text);
-                    current_prompt_index = events.upsert_prompt(ts_ms, &text, task_stack.path());
+                    current_prompt_index = events.upsert_prompt(&mut built, ts_ms, &text, task_stack.path())?;
                 }
             }
             Some("user") => {
                 if let Some(text) = local_message_preview(msg.get("content").unwrap_or(msg)) {
                     task_stack.observe_user(&text);
-                    current_prompt_index = events.upsert_prompt(ts_ms, &text, task_stack.path());
+                    current_prompt_index = events.upsert_prompt(&mut built, ts_ms, &text, task_stack.path())?;
                 }
             }
             Some("gemini") | Some("assistant") | Some("model") => {
@@ -1327,14 +1363,14 @@ fn parse_gemini_json(path: &Path, updated: SystemTime, content: &str) -> Option<
                                 status.to_string()
                             };
                         }
-                        events.tools.push(event);
+                        built.push(&mut events.tools, event)?;
                     }
                 }
                 let content = msg.get("content").unwrap_or(msg);
                 let text = content_to_text(content);
                 let tokens = msg.get("tokens").unwrap_or(&Value::Null);
                 if !text.trim().is_empty() || tokens.is_object() {
-                    events.llm_responses.push(LlmResponse {
+                    built.push(&mut events.llm_responses, LlmResponse {
                         ts_ms,
                         prompt_index: current_prompt_index,
                         model: llm_model,
@@ -1365,7 +1401,7 @@ fn parse_gemini_json(path: &Path, updated: SystemTime, content: &str) -> Option<
                         },
                         skill: String::new(),
                         task_path: task_stack.path(),
-                    });
+                    })?;
                 }
             }
             _ => {}
@@ -1411,14 +1447,16 @@ fn parse_cursor_jsonl(
     acc.cwd = cursor_session_cwd(content, children);
 
     let mut delegations = Vec::new();
+    let mut built = Built::default();
     cursor_absorb_transcript(
         content,
         CursorScope::Parent,
         &mut acc,
         &mut events,
+        &mut built,
         &mut current_prompt_index,
         &mut delegations,
-    );
+    )?;
     for (_, child_content) in children {
         // Attribute the child's work to the prompt that delegated it, not the last one.
         let mut index = cursor_delegating_prompt_index(child_content, &delegations)
@@ -1428,9 +1466,10 @@ fn parse_cursor_jsonl(
             CursorScope::Subagent,
             &mut acc,
             &mut events,
+            &mut built,
             &mut index,
             &mut Vec::new(),
-        );
+        )?;
     }
 
     acc.finish_with_events(events)
@@ -1448,9 +1487,10 @@ fn cursor_absorb_transcript(
     scope: CursorScope,
     acc: &mut SessionAccumulator,
     events: &mut SessionEvents,
+    built: &mut Built,
     current_prompt_index: &mut usize,
     delegations: &mut Vec<(usize, String)>,
-) {
+) -> Option<()> {
     // Tools recorded since the last turn marker, so a failed turn can mark them.
     let mut turn_start = events.tools.len();
     // Clock carried forward from the most recent user message wrapper.
@@ -1497,7 +1537,7 @@ fn cursor_absorb_transcript(
                     let text = cursor_user_query(&raw);
                     if !text.is_empty() {
                         *current_prompt_index =
-                            events.upsert_prompt(current_ts_ms, &text, Vec::new());
+                            events.upsert_prompt(built, current_ts_ms, &text, Vec::new())?;
                         if acc.prompt_preview.is_none() {
                             acc.prompt_preview = Some(truncate_clean(&text, 180));
                         }
@@ -1516,11 +1556,11 @@ fn cursor_absorb_transcript(
                     {
                         delegations.push((*current_prompt_index, prompt.trim().to_string()));
                     }
-                    cursor_push_tool_event(part, acc, events, *current_prompt_index, current_ts_ms);
+                    cursor_push_tool_event(part, acc, events, built, *current_prompt_index, current_ts_ms)?;
                 }
                 let text = cursor_text_of(&record);
                 if !text.is_empty() {
-                    events.llm_responses.push(LlmResponse {
+                    built.push(&mut events.llm_responses, LlmResponse {
                         ts_ms: current_ts_ms,
                         prompt_index: *current_prompt_index,
                         // Model, tokens, and timestamps live in state.vscdb, not
@@ -1538,12 +1578,13 @@ fn cursor_absorb_transcript(
                         response_phase: String::new(),
                         skill: String::new(),
                         task_path: Vec::new(),
-                    });
+                    })?;
                 }
             }
             _ => {}
         }
     }
+    Some(())
 }
 
 fn cursor_session_cwd(content: &str, children: &[(PathBuf, String)]) -> Option<String> {
@@ -1704,15 +1745,16 @@ fn cursor_push_tool_event(
     part: &Value,
     acc: &mut SessionAccumulator,
     events: &mut SessionEvents,
+    built: &mut Built,
     prompt_index: usize,
     ts_ms: Option<i64>,
-) {
+) -> Option<()> {
     let Some(name) = part
         .get("name")
         .and_then(Value::as_str)
         .filter(|n| !n.is_empty())
     else {
-        return;
+        return Some(());
     };
     let input = part.get("input").cloned().unwrap_or(Value::Null);
 
@@ -1730,7 +1772,7 @@ fn cursor_push_tool_event(
     for path in &event.paths {
         acc.add_file(&path.path);
     }
-    events.tools.push(event);
+    built.push(&mut events.tools, event)
 }
 
 fn cursor_text_of(record: &Value) -> String {
@@ -1983,7 +2025,13 @@ fn add_usage(
 }
 
 impl SessionEvents {
-    fn upsert_prompt(&mut self, ts_ms: Option<i64>, text: &str, task_path: Vec<String>) -> usize {
+    fn upsert_prompt(
+        &mut self,
+        built: &mut Built,
+        ts_ms: Option<i64>,
+        text: &str,
+        task_path: Vec<String>,
+    ) -> Option<usize> {
         let hash = short_hash(text, 12);
         if let Some(existing) = self.prompts.iter().rposition(|prompt| {
             prompt.text_hash == hash
@@ -1996,10 +2044,10 @@ impl SessionEvents {
                     _ => false,
                 }
         }) {
-            return existing;
+            return Some(existing);
         }
         let index = self.prompts.len();
-        self.prompts.push(UserPrompt {
+        built.push(&mut self.prompts, UserPrompt {
             index,
             ts_ms,
             text_hash: hash,
@@ -2007,8 +2055,8 @@ impl SessionEvents {
             preview: truncate_clean(text, 180),
             tag: String::new(),
             task_path,
-        });
-        index
+        })?;
+        Some(index)
     }
 }
 
@@ -3863,6 +3911,41 @@ mod tests {
             CLAUDE_SESSION
         );
         assert_eq!(read_session_file(&huge).expect("read the huge line"), "");
+        fs::remove_dir_all(home).expect("remove scratch directory");
+    }
+
+    /// A value one line sets is copied into every later event, so a file well
+    /// under the window can build hundreds of MiB (Sol r3: a 200 KiB model,
+    /// measured at 314 MiB). Such a parse stops at the cache's budget and gives
+    /// no session; an honest file still parses.
+    #[test]
+    fn a_file_that_builds_past_the_budget_gives_no_session() {
+        let home = scratch("agentsight-built");
+        let project = home.join(".claude/projects/-w");
+        fs::create_dir_all(&project).expect("project");
+        let big = "m".repeat(200 * 1024);
+        let shapes = [
+            (
+                format!(r#"{{"type":"assistant","message":{{"model":"{big}","usage":{{}}}}}}"#),
+                r#"{"type":"assistant","message":{"usage":{}}}"#,
+            ),
+            (
+                format!(
+                    r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Skill","input":{{"skill":"{big}"}}}}]}}}}"#
+                ),
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{}}]}}"#,
+            ),
+        ];
+        for (n, (first, tiny)) in shapes.iter().enumerate() {
+            let body = format!("{first}\n{}", format!("{tiny}\n").repeat(1500));
+            assert!((body.len() as u64) < MAX_SESSION_FILE_BYTES, "under the window");
+            let path = project.join(format!("s{n}.jsonl"));
+            fs::write(&path, body).expect("session");
+            assert!(parse_session_path(&path).is_none(), "shape {n} built past the budget");
+        }
+        let honest = project.join("honest.jsonl");
+        fs::write(&honest, CLAUDE_SESSION).expect("honest session");
+        assert!(parse_session_path(&honest).is_some(), "an honest session parses");
         fs::remove_dir_all(home).expect("remove scratch directory");
     }
 
