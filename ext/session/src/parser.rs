@@ -177,12 +177,12 @@ pub fn session_candidate_from_path(path: &Path) -> Option<SessionCandidate> {
     })
 }
 
-/// The most of one session file a parser reads. Parsing costs up to about 19
-/// times its input (one line of a JSON array of small numbers), a session
-/// folder can be writable by a workload the collector watches, and the
-/// collector has a fixed memory limit. A longer file is read from its end, so
-/// the newest turns stay visible.
-const MAX_SESSION_FILE_BYTES: u64 = 4 * 1024 * 1024;
+/// The most of one session file a parser reads. Parsing one line can cost
+/// about 100 times its size (a line of tiny JSON objects), a session folder
+/// can be writable by a workload the collector watches, and the collector has
+/// a fixed memory limit. A longer file is read from its end, so the newest
+/// turns stay visible.
+const MAX_SESSION_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Read a session file: a regular file only, opened without following a link
 /// at its name or blocking on a FIFO, and checked on the open file, so a swap
