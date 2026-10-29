@@ -172,7 +172,7 @@ pub fn session_candidate_from_path(path: &Path) -> Option<SessionCandidate> {
         .unwrap_or(UNIX_EPOCH);
     Some(SessionCandidate {
         agent,
-        path: path.to_path_buf(),
+        path: real_path(path).ok()?,
         updated,
     })
 }
@@ -183,6 +183,10 @@ pub fn session_candidate_from_path(path: &Path) -> Option<SessionCandidate> {
 /// a fixed memory limit. A longer file is read from its end, so the newest
 /// turns stay visible.
 const MAX_SESSION_FILE_BYTES: u64 = 512 * 1024;
+
+/// The longest session or conversation id kept: an id falls back to a file
+/// name, which is at most 255 bytes.
+const MAX_ID_BYTES: usize = 256;
 
 /// What one parse has built, as JSON bytes, counted as each event is added.
 /// The window bounds the file, not what parsing builds from it: a value one
@@ -220,9 +224,12 @@ pub(crate) fn json_len(value: &impl serde::Serialize) -> usize {
 
 /// Read a session file: a regular file only, opened without following a link
 /// at its name or blocking on a FIFO, and checked on the open file, so a swap
-/// after discovery cannot change what is read. A file over
-/// [`MAX_SESSION_FILE_BYTES`] is read as its last whole lines within that.
-fn read_session_file(path: &Path) -> io::Result<String> {
+/// after discovery cannot change what is read. On unix the open file must be
+/// at `path` itself, so a parent directory swapped for a link is refused too.
+/// A JSON Lines file over [`MAX_SESSION_FILE_BYTES`] is read as its last whole
+/// lines within that; a document (`lines: false`, Gemini) is read whole, as a
+/// window would cut it.
+fn read_session_file(path: &Path, lines: bool) -> io::Result<String> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -237,6 +244,21 @@ fn read_session_file(path: &Path) -> io::Result<String> {
             io::ErrorKind::InvalidInput,
             format!("{} is not a regular file", path.display()),
         ));
+    }
+    #[cfg(unix)]
+    {
+        let opened = opened_path(&file)?;
+        if opened != path {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} opened at {}", path.display(), opened.display()),
+            ));
+        }
+    }
+    if !lines {
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
+        return Ok(text);
     }
     let tail = meta.len() > MAX_SESSION_FILE_BYTES;
     if tail {
@@ -260,9 +282,35 @@ fn read_session_file(path: &Path) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
+/// Where the kernel opened `file`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn opened_path(file: &fs::File) -> io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// Where the kernel opened `file`.
+#[cfg(target_vendor = "apple")]
+fn opened_path(file: &fs::File) -> io::Result<PathBuf> {
+    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes at most PATH_MAX bytes, NUL included, into buf.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len])))
+}
+
+/// Elsewhere where a file opened cannot be checked, so none is read.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))))]
+fn opened_path(_: &fs::File) -> io::Result<PathBuf> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "cannot check where a session file opened"))
+}
+
 /// Parse a session file from a candidate.
 pub fn parse_session_file(candidate: &SessionCandidate) -> Option<AgentSession> {
-    let content = read_session_file(&candidate.path).ok()?;
+    let content = read_session_file(&candidate.path, candidate.agent != AGENT_GEMINI).ok()?;
     let cursor_children = if candidate.agent == AGENT_CURSOR {
         read_cursor_subagents(&candidate.path)
     } else {
@@ -1423,7 +1471,7 @@ fn read_cursor_subagents(path: &Path) -> Vec<(PathBuf, String)> {
         .map(|entry| entry.path())
         .filter(|child| child.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
         .filter_map(|child| {
-            let content = read_session_file(&child).ok()?;
+            let content = read_session_file(&child, true).ok()?;
             Some((child, content))
         })
         .collect();
@@ -1899,6 +1947,13 @@ impl SessionAccumulator {
         {
             return None;
         }
+        // A view copies the ids into every row it builds from the session (one
+        // per tool call in `top`), which the parse budget does not count.
+        if self.session_id.len() > MAX_ID_BYTES
+            || self.conversation_id.as_ref().is_some_and(|id| id.len() > MAX_ID_BYTES)
+        {
+            return None;
+        }
         let display_id = format!("{}:{}", self.agent_type, short_session_id(&self.session_id));
         Some(AgentSession {
             agent_type: self.agent_type,
@@ -1937,6 +1992,21 @@ impl SessionAccumulator {
 // ---------------------------------------------------------------------------
 
 fn walk_agent_files(agent: &'static str, dir: &Path, f: &mut dyn FnMut(&Path, &fs::Metadata)) {
+    if let Ok(root) = real_path(dir) {
+        walk_real_dir(agent, &root, f);
+    }
+}
+
+/// The path a file under `path` is opened at: on unix its real path, which
+/// `read_session_file` checks the open file against.
+fn real_path(path: &Path) -> io::Result<PathBuf> {
+    #[cfg(unix)]
+    return fs::canonicalize(path);
+    #[cfg(not(unix))]
+    Ok(path.to_path_buf())
+}
+
+fn walk_real_dir(agent: &'static str, dir: &Path, f: &mut dyn FnMut(&Path, &fs::Metadata)) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -1949,7 +2019,7 @@ fn walk_agent_files(agent: &'static str, dir: &Path, f: &mut dyn FnMut(&Path, &f
             continue;
         };
         if meta.is_dir() {
-            walk_agent_files(agent, &path, f);
+            walk_real_dir(agent, &path, f);
         } else if is_agent_file_for(agent, &path) {
             if meta.is_file() {
                 f(&path, &meta);
@@ -3850,7 +3920,8 @@ mod tests {
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("{name}-{}-{unique}", std::process::id()));
         fs::create_dir_all(&dir).expect("create scratch directory");
-        dir
+        // macOS's temp folder is behind a link.
+        real_path(&dir).expect("scratch directory path")
     }
 
     #[cfg(unix)]
@@ -3938,10 +4009,10 @@ mod tests {
 
         assert_eq!(sessions, 2, "the real session and the long file's end");
         assert_eq!(
-            read_session_file(&long).expect("read the long file"),
+            read_session_file(&long, true).expect("read the long file"),
             CLAUDE_SESSION
         );
-        assert_eq!(read_session_file(&huge).expect("read the huge line"), "");
+        assert_eq!(read_session_file(&huge, true).expect("read the huge line"), "");
         fs::remove_dir_all(home).expect("remove scratch directory");
     }
 
@@ -3993,9 +4064,57 @@ mod tests {
         mkfifo(&fifo);
 
         for path in [zero.as_path(), fifo.as_path(), Path::new("/dev/zero")] {
-            assert!(read_session_file(path).is_err(), "{path:?}");
+            assert!(read_session_file(path, true).is_err(), "{path:?}");
         }
         fs::remove_dir_all(dir).expect("remove scratch directory");
+    }
+
+    /// A parent directory swapped for a link after discovery: the open file is
+    /// not where discovery named it, so it is not read.
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_directory_swapped_for_a_link_is_not_read() {
+        let home = scratch("agentsight-swap");
+        let project = home.join(".claude/projects/-w");
+        let outside = home.join("outside");
+        fs::create_dir_all(&project).expect("project");
+        fs::create_dir_all(&outside).expect("outside");
+        fs::write(project.join("s.jsonl"), CLAUDE_SESSION).expect("session");
+        fs::write(outside.join("s.jsonl"), CLAUDE_SESSION).expect("outside session");
+        let candidate = session_candidate_from_path(&project.join("s.jsonl")).expect("candidate");
+        assert!(parse_session_file(&candidate).is_some(), "the session parses before the swap");
+        fs::rename(&project, home.join("moved")).expect("move the project");
+        std::os::unix::fs::symlink(&outside, &project).expect("link in its place");
+        assert!(parse_session_file(&candidate).is_none(), "a file outside the tree was read");
+        fs::remove_dir_all(home).expect("remove scratch directory");
+    }
+
+    /// `top` copies a session's ids into one row per tool call, which the parse
+    /// budget does not count, so a longer id gives no session.
+    #[test]
+    fn an_id_too_long_to_copy_into_every_row_gives_no_session() {
+        let line = |key: &str, id: &str| {
+            format!(r#"{{"type":"assistant","{key}":"{id}","message":{{"model":"m","content":[{{"type":"tool_use","id":"t","name":"Read","input":{{"file_path":"a.rs"}}}}],"usage":{{"input_tokens":1,"output_tokens":1}}}}}}"#)
+        };
+        let parse = |content: &str| parse_session_content(AGENT_CLAUDE, Path::new("/tmp/s.jsonl"), UNIX_EPOCH, content);
+        for key in ["sessionId", "conversation_id"] {
+            assert!(parse(&line(key, &"c".repeat(MAX_ID_BYTES + 1))).is_none(), "a long {key} was kept");
+            assert!(parse(&line(key, &"c".repeat(MAX_ID_BYTES))).is_some(), "{key} at the limit");
+        }
+    }
+
+    /// Gemini's session is one JSON document: a window would cut its opening,
+    /// so it is read whole.
+    #[test]
+    fn a_gemini_document_over_the_window_is_read_whole() {
+        let home = scratch("agentsight-gemini");
+        let chats = home.join(".gemini/tmp/p/chats");
+        fs::create_dir_all(&chats).expect("chats");
+        let text = "x".repeat(MAX_SESSION_FILE_BYTES as usize);
+        let path = chats.join("session-1.json");
+        fs::write(&path, format!(r#"{{"messages":[{{"type":"user","content":"{text}"}},{{"type":"gemini","timestamp":"2026-01-01T00:00:00Z","toolCalls":[{{"id":"t1","name":"write_file","args":{{"file_path":"src/lib.rs"}},"status":"success"}}]}}]}}"#)).expect("session");
+        assert!(parse_session_path(&path).is_some(), "a Gemini session over the window gave nothing");
+        fs::remove_dir_all(home).expect("remove scratch directory");
     }
 
     // A parent transcript that both delegates and works directly, since Cursor mixes both.
@@ -4047,14 +4166,7 @@ mod tests {
 
     #[test]
     fn cursor_file_discovery_aggregates_children_but_content_parsing_stays_pure() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "agentsight-cursor-parser-{}-{unique}",
-            std::process::id()
-        ));
+        let root = scratch("agentsight-cursor-parser");
         let parent_dir = root.join("session");
         let child_dir = parent_dir.join("subagents");
         fs::create_dir_all(&child_dir).expect("create fixture directories");
