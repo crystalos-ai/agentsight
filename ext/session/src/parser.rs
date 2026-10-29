@@ -171,9 +171,12 @@ pub fn session_candidate_from_path(path: &Path) -> Option<SessionCandidate> {
     let updated = fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .unwrap_or(UNIX_EPOCH);
+    // The folder's real path, not the file's: a link at the file name is
+    // refused when the file is opened, not followed here.
+    let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
     Some(SessionCandidate {
         agent,
-        path: real_path(path).ok()?,
+        path: real_path(dir.unwrap_or(Path::new("."))).ok()?.join(path.file_name()?),
         updated,
     })
 }
@@ -1958,6 +1961,23 @@ const MAX_SUMMARY_KEY_BYTES: usize = 256 * 1024;
 /// What one map entry costs beyond its key's bytes.
 const SUMMARY_KEY_COST: usize = 64;
 
+/// The longest tool or model name counted apart, and the most models one
+/// session counts apart. A sampled tool row copies its name twice, and each
+/// model gets a token row; real names are under 100 bytes, and a session uses
+/// a few models. Past either, or past the key budget, a call or a usage report
+/// counts under [`OTHER_NAME`], so totals keep counting, and marks the session
+/// truncated.
+const MAX_NAME_BYTES: usize = 256;
+const MAX_MODELS: usize = 64;
+const OTHER_NAME: &str = "(other)";
+
+/// Whether `room` holds a new `key`, taking its cost if so.
+fn take_room(room: &mut usize, key: &str) -> bool {
+    room.checked_sub(key.len() + SUMMARY_KEY_COST)
+        .map(|left| *room = left)
+        .is_some()
+}
+
 /// The entry for `key` in `map`, or `None` for a new key that `room` has no
 /// room for.
 fn summary_entry<'m, V: Default>(
@@ -1965,10 +1985,22 @@ fn summary_entry<'m, V: Default>(
     key: &str,
     room: &mut usize,
 ) -> Option<&'m mut V> {
-    if !map.contains_key(key) {
-        *room = room.checked_sub(key.len() + SUMMARY_KEY_COST)?;
-    }
-    Some(map.entry(key.to_string()).or_default())
+    (map.contains_key(key) || take_room(room, key)).then(|| map.entry(key.to_string()).or_default())
+}
+
+/// The entry for the tool or model `name` in `map`, or for [`OTHER_NAME`]
+/// (with `true`) when `name` is new and too long, past `max_names`, or past
+/// `room`.
+fn named_entry<'m, V: Default>(
+    map: &'m mut BTreeMap<String, V>,
+    name: &str,
+    room: &mut usize,
+    max_names: usize,
+) -> (&'m mut V, bool) {
+    let own = map.contains_key(name)
+        || (name.len() <= MAX_NAME_BYTES && map.len() < max_names && take_room(room, name));
+    let name = if own { name } else { OTHER_NAME };
+    (map.entry(name.to_string()).or_default(), !own)
 }
 
 impl SessionAccumulator {
@@ -2030,19 +2062,17 @@ impl SessionAccumulator {
         cache_read: i64,
         total: i64,
     ) {
-        let mut usage = TokenUsage::default();
-        usage.add(input, output, cache_creation, cache_read, total);
-        match summary_entry(&mut self.model_usage, model, &mut self.key_room) {
-            Some(slot) => *slot = usage,
-            None => self.truncated = true,
-        }
+        let (slot, other) =
+            named_entry(&mut self.model_usage, model, &mut self.key_room, MAX_MODELS);
+        *slot = TokenUsage::default();
+        slot.add(input, output, cache_creation, cache_read, total);
+        self.truncated |= other;
     }
 
     fn add_tool(&mut self, name: &str) {
-        match summary_entry(&mut self.tools, name, &mut self.key_room) {
-            Some(count) => *count += 1,
-            None => self.truncated = true,
-        }
+        let (count, other) = named_entry(&mut self.tools, name, &mut self.key_room, usize::MAX);
+        *count += 1;
+        self.truncated |= other;
     }
 
     fn add_file(&mut self, path: &str) {
@@ -2202,8 +2232,7 @@ pub(crate) fn user_home_dir() -> Option<PathBuf> {
         .or_else(dirs::home_dir)
 }
 
-/// Add usage to `model`'s entry, or `false` for a new model `room` has no
-/// room for.
+/// Add usage to `model`'s entry, or to [`OTHER_NAME`]'s with `false`.
 #[allow(clippy::too_many_arguments)]
 fn add_usage(
     models: &mut BTreeMap<String, TokenUsage>,
@@ -2215,11 +2244,9 @@ fn add_usage(
     cache_read: i64,
     total: i64,
 ) -> bool {
-    let Some(usage) = summary_entry(models, model, room) else {
-        return false;
-    };
+    let (usage, other) = named_entry(models, model, room, MAX_MODELS);
     usage.add(input, output, cache_creation, cache_read, total);
-    true
+    !other
 }
 
 impl SessionEvents {
@@ -4244,6 +4271,40 @@ mod tests {
         let past = parse(MAX_SEEN_USAGE + 1);
         assert!(past.truncated);
         assert_eq!(past.usage.input_tokens, MAX_SEEN_USAGE as i64);
+    }
+
+    /// A tool or model name past the longest counted apart, and models past
+    /// the most, count under one name, so totals keep counting.
+    #[test]
+    fn long_names_and_many_models_count_under_one_name() {
+        let long = "t".repeat(MAX_NAME_BYTES + 1);
+        let calls = MAX_MODELS + 10;
+        let body: String = (0..calls)
+            .map(|n| format!("{{\"type\":\"assistant\",\"requestId\":\"{n}\",\"message\":{{\"model\":\"m{n}\",\"usage\":{{\"input_tokens\":1}},\"content\":[{{\"type\":\"tool_use\",\"name\":\"{long}\",\"input\":{{}}}}]}}}}\n"))
+            .collect();
+        let session = parse_session_content(AGENT_CLAUDE, Path::new("/tmp/s.jsonl"), UNIX_EPOCH, &body)
+            .expect("a session");
+        assert!(session.truncated);
+        assert_eq!(session.tools.keys().collect::<Vec<_>>(), [OTHER_NAME]);
+        assert_eq!(session.tools[OTHER_NAME], calls);
+        assert_eq!(session.model_usage.len(), MAX_MODELS + 1);
+        assert_eq!(session.usage.input_tokens, calls as i64);
+    }
+
+    /// A link at the file name is not followed: the candidate names the link,
+    /// and the read refuses it.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_path_that_is_a_link_is_not_read() {
+        let home = scratch("agentsight-leaf");
+        let project = home.join(".claude/projects/-w");
+        fs::create_dir_all(&project).expect("project");
+        fs::write(home.join("outside.jsonl"), CLAUDE_SESSION).expect("outside session");
+        std::os::unix::fs::symlink(home.join("outside.jsonl"), project.join("s.jsonl")).expect("link");
+        let candidate = session_candidate_from_path(&project.join("s.jsonl")).expect("candidate");
+        assert!(candidate.path.ends_with("-w/s.jsonl"), "{:?}", candidate.path);
+        assert!(parse_session_file(&candidate).is_none(), "the link was followed");
+        fs::remove_dir_all(home).expect("remove scratch directory");
     }
 
     /// The read itself opens only a regular file, whatever discovery saw: not

@@ -247,6 +247,8 @@ struct CacheEntry {
     /// The JSON length of `session`, its share of the budget.
     bytes: usize,
     pinned: bool,
+    /// Whether `session`'s events were dropped for the budget.
+    trimmed: bool,
 }
 
 impl CacheEntry {
@@ -260,6 +262,7 @@ impl CacheEntry {
             session,
             bytes,
             pinned,
+            trimmed: false,
         }
     }
 }
@@ -279,6 +282,11 @@ impl SessionCache {
         if let Some(entry) = self.entries.get_mut(path)
             && entry.mtime == candidate.updated
         {
+            // A session trimmed for the budget is read again, whole, and not
+            // kept: its events are what the caller asked for.
+            if entry.trimmed {
+                return parse_session_file(&candidate);
+            }
             entry.pinned = true;
             let session = entry.session.clone();
             self.trim_pinned_details();
@@ -377,6 +385,7 @@ impl SessionCache {
                         session.events = SessionEvents::default();
                         session.truncated = true;
                         entry.bytes = crate::parser::json_len(session);
+                        entry.trimmed = true;
                     }
                 }
             }
@@ -462,11 +471,14 @@ mod tests {
         assert_eq!(shown.len(), 5, "every session is shown: {shown:?}");
         assert_eq!(shown[0], ("costly-4.jsonl", false), "the newest first, with events");
         assert_eq!(shown[4], ("honest.jsonl", false), "an honest session after them keeps its events");
-        let trimmed: Vec<_> = sessions.iter().filter(|s| s.events.llm_responses.is_empty()).collect();
+        let bash = sessions[0].tools["Bash"];
+        let trimmed: Vec<_> = sessions.iter().filter(|s| s.events.llm_responses.is_empty()).cloned().collect();
         assert!(!trimmed.is_empty(), "a costly transcript past the budget: {shown:?}");
         for session in trimmed {
             assert!(session.truncated);
-            assert_eq!(session.tools["Bash"], sessions[0].tools["Bash"], "its totals are kept");
+            assert_eq!(session.tools["Bash"], bash, "its totals are kept");
+            let read = cache.parse_path_cached(&session.path).expect("a detail read");
+            assert!(!read.events.llm_responses.is_empty(), "a detail read has its events");
         }
         fs::remove_dir_all(home).expect("remove scratch directory");
     }
