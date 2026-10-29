@@ -47,15 +47,23 @@ pub fn snapshot(
     limit: usize,
     max_age: Duration,
 ) -> Snapshot {
-    let filtered = discover_sessions(cache, pid_filter, text_filter, limit, max_age);
-    view_of(&filtered, SNAPSHOT_TOOL_ROWS_PER_SESSION)
-        .export_snapshot(SnapshotOptions { audit_limit: 0 })
+    sampled_snapshot(&discover_sessions(cache, pid_filter, text_filter, limit, max_age))
 }
 
 /// The most tool rows a session gives a `snapshot`. Its session row's `tools`
 /// attribute counts every call, so a long session costs a row per call only
 /// in the views that list calls.
 const SNAPSHOT_TOOL_ROWS_PER_SESSION: usize = 16;
+
+/// A snapshot with a sample of each session's tool rows, whose summary still
+/// counts every call.
+fn sampled_snapshot(sessions: &[LocalSession]) -> Snapshot {
+    let mut snapshot = view_of(sessions, SNAPSHOT_TOOL_ROWS_PER_SESSION)
+        .export_snapshot(SnapshotOptions { audit_limit: 0 });
+    let calls: usize = sessions.iter().flat_map(|session| session.tools.values()).sum();
+    snapshot.summary.view_events += (calls - snapshot.tool_calls.len()) as i64;
+    snapshot
+}
 
 pub fn discover_sessions(
     cache: &mut SessionCache,
@@ -1730,8 +1738,7 @@ mod tests {
         let content = format!("{line}\n").repeat(SNAPSHOT_TOOL_ROWS_PER_SESSION * 3);
         let session = parse_content_for_test("claude", &path, UNIX_EPOCH, &content).unwrap();
 
-        let snapshot = view_of(std::slice::from_ref(&session), SNAPSHOT_TOOL_ROWS_PER_SESSION)
-            .export_snapshot(SnapshotOptions { audit_limit: 0 });
+        let snapshot = sampled_snapshot(std::slice::from_ref(&session));
         assert_eq!(snapshot.tool_calls.len(), SNAPSHOT_TOOL_ROWS_PER_SESSION);
         assert_eq!(
             snapshot.sessions[0].attributes["tools"]["Read"],
@@ -1739,6 +1746,7 @@ mod tests {
         );
         let full = materialized_view(&[session]).export_snapshot(SnapshotOptions { audit_limit: 0 });
         assert_eq!(full.tool_calls.len(), SNAPSHOT_TOOL_ROWS_PER_SESSION * 3);
+        assert_eq!(snapshot.summary.view_events, full.summary.view_events);
     }
 
     #[test]
