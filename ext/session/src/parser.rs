@@ -7,7 +7,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::hash::{Hash, Hasher};
+use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -177,31 +178,45 @@ pub fn session_candidate_from_path(path: &Path) -> Option<SessionCandidate> {
     })
 }
 
-/// The most of one session file a parser reads. Parsing one line can cost
-/// about 100 times its size (a line of tiny JSON objects), a session folder
-/// can be writable by a workload the collector watches, and the collector has
-/// a fixed memory limit. A longer file is read from its end, so the newest
-/// turns stay visible.
-const MAX_SESSION_FILE_BYTES: u64 = 512 * 1024;
+/// The longest line a parser reads. Parsing one line can cost about 100 times
+/// its size (a line of tiny JSON objects), a session folder can be writable by
+/// a workload the collector watches, and the collector has a fixed memory
+/// limit. A longer line is skipped and marks the session truncated.
+const MAX_LINE_BYTES: usize = 512 * 1024;
+
+/// The most of one session a parser reads: a file, or a Cursor transcript and
+/// its sub-agents together. JSON Lines are read one line at a time, so only a
+/// Cursor transcript or a Gemini document is held whole.
+const MAX_READ_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The longest session or conversation id kept: an id falls back to a file
 /// name, which is at most 255 bytes.
 const MAX_ID_BYTES: usize = 256;
 
-/// What one parse has built, as JSON bytes, counted as each event is added.
-/// The window bounds the file, not what parsing builds from it: a value one
-/// line sets (a model, a skill, a task) is copied into every later event, so a
-/// file well under the window could build hundreds of MiB. A parse stops, with
-/// no session, once it passes the session cache's budget: the cache could never
-/// keep that session.
+/// What one parse keeps, as JSON bytes, counted as each event is added. A
+/// value one line sets (a model, a skill, a task) is copied into every later
+/// event, so a short file could build hundreds of MiB. Past the session
+/// cache's budget a parse keeps no more events, but still counts the
+/// session's totals, and marks the session truncated.
 #[derive(Default)]
 struct Built(usize);
 
 impl Built {
-    /// Add `event` to `events`, or `None` once the parse is over the budget.
-    fn push<T: serde::Serialize>(&mut self, events: &mut Vec<T>, event: T) -> Option<()> {
-        self.0 = self.0.saturating_add(json_len(&event));
-        (self.0 <= MAX_CACHED_SESSION_BYTES).then(|| events.push(event))
+    /// Add `event` to `events` while the parse is within the budget, and say
+    /// whether it was kept.
+    fn push<T: serde::Serialize>(&mut self, events: &mut Vec<T>, event: T) -> bool {
+        if !self.over() {
+            self.0 = self.0.saturating_add(json_len(&event));
+        }
+        let kept = !self.over();
+        if kept {
+            events.push(event);
+        }
+        kept
+    }
+
+    fn over(&self) -> bool {
+        self.0 > MAX_CACHED_SESSION_BYTES
     }
 }
 
@@ -222,14 +237,11 @@ pub(crate) fn json_len(value: &impl serde::Serialize) -> usize {
     serde_json::to_writer(&mut count, value).map_or(usize::MAX, |()| count.0)
 }
 
-/// Read a session file: a regular file only, opened without following a link
+/// Open a session file: a regular file only, opened without following a link
 /// at its name or blocking on a FIFO, and checked on the open file, so a swap
 /// after discovery cannot change what is read. On unix the open file must be
 /// at `path` itself, so a parent directory swapped for a link is refused too.
-/// A JSON Lines file over [`MAX_SESSION_FILE_BYTES`] is read as its last whole
-/// lines within that; a document (`lines: false`, Gemini) is read whole, as a
-/// window would cut it.
-fn read_session_file(path: &Path, lines: bool) -> io::Result<String> {
+fn open_session_file(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -237,9 +249,8 @@ fn read_session_file(path: &Path, lines: bool) -> io::Result<String> {
         &mut options,
         libc::O_NOFOLLOW | libc::O_NONBLOCK,
     );
-    let mut file = options.open(path)?;
-    let meta = file.metadata()?;
-    if !meta.is_file() {
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{} is not a regular file", path.display()),
@@ -255,31 +266,87 @@ fn read_session_file(path: &Path, lines: bool) -> io::Result<String> {
             ));
         }
     }
-    if !lines {
+    Ok(file)
+}
+
+/// The lines of a session file, read one at a time up to a byte limit. A line
+/// over [`MAX_LINE_BYTES`] or not UTF-8 is skipped; it, reaching the limit or
+/// a read error marks the read `truncated`.
+struct FileLines {
+    reader: io::Take<io::BufReader<fs::File>>,
+    truncated: bool,
+}
+
+impl FileLines {
+    fn open(path: &Path, limit: u64) -> io::Result<Self> {
+        Ok(Self {
+            reader: io::BufReader::new(open_session_file(path)?).take(limit),
+            truncated: false,
+        })
+    }
+
+    /// The rest of the lines, joined.
+    fn text(&mut self) -> String {
         let mut text = String::new();
-        file.read_to_string(&mut text)?;
-        return Ok(text);
+        for line in self.by_ref() {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        text
     }
-    let tail = meta.len() > MAX_SESSION_FILE_BYTES;
-    if tail {
-        log::debug!(
-            "session file {} is {} bytes; reading its last {MAX_SESSION_FILE_BYTES}",
-            path.display(),
-            meta.len()
-        );
-        file.seek(SeekFrom::Start(meta.len() - MAX_SESSION_FILE_BYTES))?;
+
+    fn read_line(&mut self) -> io::Result<Option<String>> {
+        loop {
+            let mut line = Vec::new();
+            let limit = MAX_LINE_BYTES as u64 + 1;
+            if (&mut self.reader).take(limit).read_until(b'\n', &mut line)? == 0 {
+                self.truncated |= self.reader.limit() == 0;
+                return Ok(None);
+            }
+            if line.last() == Some(&b'\n') {
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+            } else if line.len() > MAX_LINE_BYTES {
+                self.truncated = true;
+                self.skip_line()?;
+                continue;
+            }
+            match String::from_utf8(line) {
+                Ok(line) => return Ok(Some(line)),
+                Err(_) => self.truncated = true,
+            }
+        }
     }
-    let mut bytes = Vec::new();
-    file.take(MAX_SESSION_FILE_BYTES).read_to_end(&mut bytes)?;
-    if tail {
-        // The window starts inside a line: drop that part.
-        let first = bytes
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(bytes.len(), |end| end + 1);
-        bytes.drain(..first);
+
+    fn skip_line(&mut self) -> io::Result<()> {
+        loop {
+            let buf = self.reader.fill_buf()?;
+            let Some(end) = buf.iter().position(|&b| b == b'\n') else {
+                if buf.is_empty() {
+                    return Ok(());
+                }
+                let len = buf.len();
+                self.reader.consume(len);
+                continue;
+            };
+            self.reader.consume(end + 1);
+            return Ok(());
+        }
     }
-    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+impl Iterator for FileLines {
+    type Item = String;
+
+    fn next(&mut self) -> Option<String> {
+        self.read_line().unwrap_or_else(|error| {
+            log::debug!("stopped reading a session file: {error}");
+            self.truncated = true;
+            None
+        })
+    }
 }
 
 /// Where the kernel opened `file`.
@@ -308,21 +375,29 @@ fn opened_path(_: &fs::File) -> io::Result<PathBuf> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "cannot check where a session file opened"))
 }
 
-/// Parse a session file from a candidate.
+/// Parse a session file from a candidate. JSON Lines are read one line at a
+/// time, and a Gemini document whole: a window would cut it.
 pub fn parse_session_file(candidate: &SessionCandidate) -> Option<AgentSession> {
-    let content = read_session_file(&candidate.path, candidate.agent != AGENT_GEMINI).ok()?;
-    let cursor_children = if candidate.agent == AGENT_CURSOR {
-        read_cursor_subagents(&candidate.path)
+    let (agent, path, updated) = (candidate.agent, &candidate.path, candidate.updated);
+    if agent == AGENT_GEMINI {
+        let mut content = String::new();
+        open_session_file(path)
+            .ok()?
+            .take(MAX_READ_BYTES)
+            .read_to_string(&mut content)
+            .ok()?;
+        return parse_gemini_json(path, updated, &content);
+    }
+    let mut lines = FileLines::open(path, MAX_READ_BYTES).ok()?;
+    let mut session = if agent == AGENT_CURSOR {
+        let content = lines.text();
+        let children = read_cursor_subagents(path, &mut lines);
+        parse_cursor_jsonl(path, updated, &content, &children)
     } else {
-        Vec::new()
-    };
-    parse_session_impl(
-        candidate.agent,
-        &candidate.path,
-        candidate.updated,
-        &content,
-        &cursor_children,
-    )
+        parse_jsonl(agent, path, updated, lines.by_ref())
+    }?;
+    session.truncated |= lines.truncated;
+    Some(session)
 }
 
 /// Parse a session file by path, detecting the agent type automatically.
@@ -352,7 +427,7 @@ fn parse_session_impl(
     } else if agent == AGENT_CURSOR {
         parse_cursor_jsonl(path, updated, content, cursor_children)
     } else {
-        parse_jsonl(agent, path, updated, content)
+        parse_jsonl(agent, path, updated, content.lines())
     }
 }
 
@@ -649,12 +724,12 @@ fn parse_jsonl(
     agent: &str,
     path: &Path,
     updated: SystemTime,
-    content: &str,
+    lines: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Option<AgentSession> {
     let mut acc = SessionAccumulator::new(agent, path, updated);
     let mut codex_model = String::new();
     let mut claude_message_models = BTreeMap::<String, TokenUsage>::new();
-    let mut claude_seen_usage = HashSet::new();
+    let mut claude_seen_usage = HashSet::<u64>::new();
     let mut events = SessionEvents::default();
     let mut built = Built::default();
     let mut current_prompt_index = 0usize;
@@ -666,8 +741,8 @@ fn parse_jsonl(
     let mut codex_owns_events = true;
     let mut codex_session_started_at = 0.0_f64;
 
-    for line in content.lines() {
-        let Ok(obj) = serde_json::from_str::<Value>(line) else {
+    for line in lines {
+        let Ok(obj) = serde_json::from_str::<Value>(line.as_ref()) else {
             continue;
         };
         let typ = obj.get("type").and_then(Value::as_str).unwrap_or("");
@@ -785,14 +860,15 @@ fn parse_jsonl(
                     .unwrap_or(AGENT_CLAUDE)
                     .to_string();
                 if let Some(usage) = obj.pointer("/message/usage")
-                    && claude_seen_usage.insert(claude_usage_key(&obj))
+                    && claude_usage_is_new(&mut claude_seen_usage, &obj, &mut acc.truncated)
                 {
                     let name = obj
                         .pointer("/message/model")
                         .and_then(Value::as_str)
                         .unwrap_or("unknown");
-                    add_usage(
+                    acc.truncated |= !add_usage(
                         &mut claude_message_models,
+                        &mut acc.key_room,
                         name,
                         json_i64(usage, "input_tokens"),
                         json_i64(usage, "output_tokens"),
@@ -837,10 +913,11 @@ fn parse_jsonl(
                         if is_plan_tool(name) {
                             task_stack.observe_plan(input);
                         }
-                        if let Some(id) = call_id {
-                            call_index.insert(id, events.tools.len());
+                        if built.push(&mut events.tools, event)
+                            && let Some(id) = call_id
+                        {
+                            call_index.insert(id, events.tools.len() - 1);
                         }
-                        built.push(&mut events.tools, event)?;
                     }
                 }
                 let text = content_to_text(content);
@@ -901,7 +978,7 @@ fn parse_jsonl(
                         },
                         skill: response_skill,
                         task_path: task_stack.path(),
-                    })?;
+                    });
                 }
             }
             (AGENT_CLAUDE, "queue-operation") if acc.prompt_preview.is_none() => {
@@ -912,7 +989,7 @@ fn parse_jsonl(
                     acc.prompt_preview = Some(truncate_clean(&text, 180));
                     task_stack.observe_user(&text);
                     current_prompt_index =
-                        events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path())?;
+                        events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path());
                 }
             }
             (AGENT_CLAUDE, "last-prompt") if acc.prompt_preview.is_none() => {
@@ -922,7 +999,7 @@ fn parse_jsonl(
                     acc.prompt_preview = Some(truncate_clean(&text, 180));
                     task_stack.observe_user(&text);
                     current_prompt_index =
-                        events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path())?;
+                        events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path());
                 }
             }
             (AGENT_CLAUDE, "user") => {
@@ -960,7 +1037,7 @@ fn parse_jsonl(
                         .filter(|value| !value.is_empty())
                         .map(str::to_string);
                     current_prompt_index =
-                        events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path())?;
+                        events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path());
                 }
             }
             (AGENT_CODEX, "turn_context") => {
@@ -1025,7 +1102,7 @@ fn parse_jsonl(
                         acc.prompt_preview = Some(truncate_clean(&text, 180));
                         task_stack.observe_user(&text);
                         current_prompt_index =
-                            events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path())?;
+                            events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path());
                     }
                 }
                 if ptype == "agent_message" {
@@ -1059,7 +1136,7 @@ fn parse_jsonl(
                                 .to_string(),
                             skill: String::new(),
                             task_path: task_stack.path(),
-                        })?;
+                        });
                     }
                 }
             }
@@ -1091,10 +1168,11 @@ fn parse_jsonl(
                 if is_plan_tool(&name) {
                     task_stack.observe_plan(&args);
                 }
-                if let Some(id) = call_id {
-                    call_index.insert(id, events.tools.len());
+                if built.push(&mut events.tools, event)
+                    && let Some(id) = call_id
+                {
+                    call_index.insert(id, events.tools.len() - 1);
                 }
-                built.push(&mut events.tools, event)?;
             }
             (AGENT_CODEX, "response_item")
                 if obj.pointer("/payload/type").and_then(Value::as_str)
@@ -1136,10 +1214,11 @@ fn parse_jsonl(
                 if is_plan_tool(name) {
                     task_stack.observe_plan(&args);
                 }
-                if let Some(id) = call_id {
-                    call_index.insert(id, events.tools.len());
+                if built.push(&mut events.tools, event)
+                    && let Some(id) = call_id
+                {
+                    call_index.insert(id, events.tools.len() - 1);
                 }
-                built.push(&mut events.tools, event)?;
             }
             (AGENT_CODEX, "response_item")
                 if obj.pointer("/payload/type").and_then(Value::as_str)
@@ -1172,7 +1251,7 @@ fn parse_jsonl(
                         acc.prompt_preview = Some(truncate_clean(&text, 180));
                         task_stack.observe_user(&text);
                         current_prompt_index =
-                            events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path())?;
+                            events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path());
                         continue;
                     }
                     let role = payload.get("role").and_then(Value::as_str);
@@ -1212,7 +1291,7 @@ fn parse_jsonl(
                             .to_string(),
                         skill: String::new(),
                         task_path: task_stack.path(),
-                    })?;
+                    });
                 }
             }
             (AGENT_CODEX, "message" | "input" | "user") => {
@@ -1220,7 +1299,7 @@ fn parse_jsonl(
                     acc.prompt_preview = Some(truncate_clean(&text, 180));
                     task_stack.observe_user(&text);
                     current_prompt_index =
-                        events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path())?;
+                        events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path());
                 }
             }
             _ if acc.prompt_preview.is_none() && typ.contains("user") => {
@@ -1228,7 +1307,7 @@ fn parse_jsonl(
                     acc.prompt_preview = Some(truncate_clean(&text, 180));
                     task_stack.observe_user(&text);
                     current_prompt_index =
-                        events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path())?;
+                        events.upsert_prompt(&mut built, ts_ms_from_event(&obj), &text, task_stack.path());
                 }
             }
             _ => {}
@@ -1240,7 +1319,7 @@ fn parse_jsonl(
     }
     events.plan = task_stack.plan;
     deduplicate_llm_responses(&mut events);
-    acc.finish_with_events(events)
+    acc.finish_with_events(events, built)
 }
 
 fn deduplicate_llm_responses(events: &mut SessionEvents) {
@@ -1333,7 +1412,7 @@ fn parse_gemini_json(path: &Path, updated: SystemTime, content: &str) -> Option<
         .unwrap_or_default();
 
     let Some(messages) = root.get("messages").and_then(Value::as_array) else {
-        return acc.finish_with_events(events);
+        return acc.finish_with_events(events, built);
     };
     for msg in messages {
         if let Some(ts) = msg.get("timestamp").and_then(Value::as_str) {
@@ -1348,13 +1427,13 @@ fn parse_gemini_json(path: &Path, updated: SystemTime, content: &str) -> Option<
                 if let Some(text) = local_message_preview(msg.get("content").unwrap_or(msg)) {
                     acc.prompt_preview = Some(truncate_clean(&text, 180));
                     task_stack.observe_user(&text);
-                    current_prompt_index = events.upsert_prompt(&mut built, ts_ms, &text, task_stack.path())?;
+                    current_prompt_index = events.upsert_prompt(&mut built, ts_ms, &text, task_stack.path());
                 }
             }
             Some("user") => {
                 if let Some(text) = local_message_preview(msg.get("content").unwrap_or(msg)) {
                     task_stack.observe_user(&text);
-                    current_prompt_index = events.upsert_prompt(&mut built, ts_ms, &text, task_stack.path())?;
+                    current_prompt_index = events.upsert_prompt(&mut built, ts_ms, &text, task_stack.path());
                 }
             }
             Some("gemini") | Some("assistant") | Some("model") => {
@@ -1411,7 +1490,7 @@ fn parse_gemini_json(path: &Path, updated: SystemTime, content: &str) -> Option<
                                 status.to_string()
                             };
                         }
-                        built.push(&mut events.tools, event)?;
+                        built.push(&mut events.tools, event);
                     }
                 }
                 let content = msg.get("content").unwrap_or(msg);
@@ -1449,35 +1528,43 @@ fn parse_gemini_json(path: &Path, updated: SystemTime, content: &str) -> Option<
                         },
                         skill: String::new(),
                         task_path: task_stack.path(),
-                    })?;
+                    });
                 }
             }
             _ => {}
         }
     }
     events.plan = task_stack.plan;
-    acc.finish_with_events(events)
+    acc.finish_with_events(events, built)
 }
 
-fn read_cursor_subagents(path: &Path) -> Vec<(PathBuf, String)> {
+/// Read a Cursor transcript's sub-agents, in name order, out of what is left
+/// of the parent's read limit; a sub-agent that does not fit marks `parent`
+/// truncated.
+fn read_cursor_subagents(path: &Path, parent: &mut FileLines) -> Vec<(PathBuf, String)> {
     let Some(dir) = path.parent().map(|parent| parent.join("subagents")) else {
         return Vec::new();
     };
     let Ok(entries) = fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let mut out: Vec<(PathBuf, String)> = entries
+    let mut children: Vec<PathBuf> = entries
         .flatten()
         .map(|entry| entry.path())
         .filter(|child| child.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
-        .filter_map(|child| {
-            let content = read_session_file(&child, true).ok()?;
-            Some((child, content))
-        })
         .collect();
     // Directory order is arbitrary; keep parses deterministic across runs.
-    out.sort_by(|left, right| left.0.cmp(&right.0));
-    out
+    children.sort();
+    children
+        .into_iter()
+        .filter_map(|child| {
+            let mut lines = FileLines::open(&child, parent.reader.limit()).ok()?;
+            let content = lines.text();
+            parent.reader.set_limit(lines.reader.limit());
+            parent.truncated |= lines.truncated;
+            Some((child, content))
+        })
+        .collect()
 }
 
 fn parse_cursor_jsonl(
@@ -1504,7 +1591,7 @@ fn parse_cursor_jsonl(
         &mut built,
         &mut current_prompt_index,
         &mut delegations,
-    )?;
+    );
     for (_, child_content) in children {
         // Attribute the child's work to the prompt that delegated it, not the last one.
         let mut index = cursor_delegating_prompt_index(child_content, &delegations)
@@ -1517,10 +1604,10 @@ fn parse_cursor_jsonl(
             &mut built,
             &mut index,
             &mut Vec::new(),
-        )?;
+        );
     }
 
-    acc.finish_with_events(events)
+    acc.finish_with_events(events, built)
 }
 
 // A sub-agent's user records hold the generated Task prompt, not a human one.
@@ -1538,7 +1625,7 @@ fn cursor_absorb_transcript(
     built: &mut Built,
     current_prompt_index: &mut usize,
     delegations: &mut Vec<(usize, String)>,
-) -> Option<()> {
+) {
     // Tools recorded since the last turn marker, so a failed turn can mark them.
     let mut turn_start = events.tools.len();
     // Clock carried forward from the most recent user message wrapper.
@@ -1585,7 +1672,7 @@ fn cursor_absorb_transcript(
                     let text = cursor_user_query(&raw);
                     if !text.is_empty() {
                         *current_prompt_index =
-                            events.upsert_prompt(built, current_ts_ms, &text, Vec::new())?;
+                            events.upsert_prompt(built, current_ts_ms, &text, Vec::new());
                         if acc.prompt_preview.is_none() {
                             acc.prompt_preview = Some(truncate_clean(&text, 180));
                         }
@@ -1604,7 +1691,7 @@ fn cursor_absorb_transcript(
                     {
                         delegations.push((*current_prompt_index, prompt.trim().to_string()));
                     }
-                    cursor_push_tool_event(part, acc, events, built, *current_prompt_index, current_ts_ms)?;
+                    cursor_push_tool_event(part, acc, events, built, *current_prompt_index, current_ts_ms);
                 }
                 let text = cursor_text_of(&record);
                 if !text.is_empty() {
@@ -1626,13 +1713,12 @@ fn cursor_absorb_transcript(
                         response_phase: String::new(),
                         skill: String::new(),
                         task_path: Vec::new(),
-                    })?;
+                    });
                 }
             }
             _ => {}
         }
     }
-    Some(())
 }
 
 fn cursor_session_cwd(content: &str, children: &[(PathBuf, String)]) -> Option<String> {
@@ -1796,13 +1882,13 @@ fn cursor_push_tool_event(
     built: &mut Built,
     prompt_index: usize,
     ts_ms: Option<i64>,
-) -> Option<()> {
+) {
     let Some(name) = part
         .get("name")
         .and_then(Value::as_str)
         .filter(|n| !n.is_empty())
     else {
-        return Some(());
+        return;
     };
     let input = part.get("input").cloned().unwrap_or(Value::Null);
 
@@ -1820,7 +1906,7 @@ fn cursor_push_tool_event(
     for path in &event.paths {
         acc.add_file(&path.path);
     }
-    built.push(&mut events.tools, event)
+    built.push(&mut events.tools, event);
 }
 
 fn cursor_text_of(record: &Value) -> String {
@@ -1857,6 +1943,32 @@ struct SessionAccumulator {
     duration_ms: u64,
     cwd: Option<String>,
     last_message_at: Option<String>,
+    /// What is left of [`MAX_SUMMARY_KEY_BYTES`] for new keys.
+    key_room: usize,
+    truncated: bool,
+}
+
+/// The most a session's tool, file and model keys may cost, at their length
+/// plus [`SUMMARY_KEY_COST`] each. A line can name a new key, so a long file
+/// could otherwise build maps of any size. The largest of 541 real Claude
+/// transcripts (up to 125 MiB) costs 26 KiB. A new key past it is not counted
+/// and marks the session truncated.
+const MAX_SUMMARY_KEY_BYTES: usize = 256 * 1024;
+
+/// What one map entry costs beyond its key's bytes.
+const SUMMARY_KEY_COST: usize = 64;
+
+/// The entry for `key` in `map`, or `None` for a new key that `room` has no
+/// room for.
+fn summary_entry<'m, V: Default>(
+    map: &'m mut BTreeMap<String, V>,
+    key: &str,
+    room: &mut usize,
+) -> Option<&'m mut V> {
+    if !map.contains_key(key) {
+        *room = room.checked_sub(key.len() + SUMMARY_KEY_COST)?;
+    }
+    Some(map.entry(key.to_string()).or_default())
 }
 
 impl SessionAccumulator {
@@ -1883,6 +1995,8 @@ impl SessionAccumulator {
             duration_ms: 0,
             cwd: None,
             last_message_at: None,
+            key_room: MAX_SUMMARY_KEY_BYTES,
+            truncated: false,
         }
     }
 
@@ -1895,8 +2009,9 @@ impl SessionAccumulator {
         cache_read: i64,
         total: i64,
     ) {
-        add_usage(
+        self.truncated |= !add_usage(
             &mut self.model_usage,
+            &mut self.key_room,
             model,
             input,
             output,
@@ -1917,15 +2032,24 @@ impl SessionAccumulator {
     ) {
         let mut usage = TokenUsage::default();
         usage.add(input, output, cache_creation, cache_read, total);
-        self.model_usage.insert(model.to_string(), usage);
+        match summary_entry(&mut self.model_usage, model, &mut self.key_room) {
+            Some(slot) => *slot = usage,
+            None => self.truncated = true,
+        }
     }
 
     fn add_tool(&mut self, name: &str) {
-        *self.tools.entry(name.to_string()).or_default() += 1;
+        match summary_entry(&mut self.tools, name, &mut self.key_room) {
+            Some(count) => *count += 1,
+            None => self.truncated = true,
+        }
     }
 
     fn add_file(&mut self, path: &str) {
-        *self.files.entry(path.to_string()).or_default() += 1;
+        match summary_entry(&mut self.files, path, &mut self.key_room) {
+            Some(count) => *count += 1,
+            None => self.truncated = true,
+        }
     }
 
     fn finish(self) -> Option<AgentSession> {
@@ -1976,10 +2100,12 @@ impl SessionAccumulator {
             cwd: self.cwd,
             last_message_at: self.last_message_at,
             events: SessionEvents::default(),
+            truncated: self.truncated,
         })
     }
 
-    fn finish_with_events(self, events: SessionEvents) -> Option<AgentSession> {
+    fn finish_with_events(mut self, events: SessionEvents, built: Built) -> Option<AgentSession> {
+        self.truncated |= built.over();
         self.finish().map(|mut session| {
             session.events = events;
             session
@@ -1998,7 +2124,7 @@ fn walk_agent_files(agent: &'static str, dir: &Path, f: &mut dyn FnMut(&Path, &f
 }
 
 /// The path a file under `path` is opened at: on unix its real path, which
-/// `read_session_file` checks the open file against.
+/// `open_session_file` checks the open file against.
 fn real_path(path: &Path) -> io::Result<PathBuf> {
     #[cfg(unix)]
     return fs::canonicalize(path);
@@ -2076,22 +2202,24 @@ pub(crate) fn user_home_dir() -> Option<PathBuf> {
         .or_else(dirs::home_dir)
 }
 
+/// Add usage to `model`'s entry, or `false` for a new model `room` has no
+/// room for.
+#[allow(clippy::too_many_arguments)]
 fn add_usage(
     models: &mut BTreeMap<String, TokenUsage>,
+    room: &mut usize,
     model: &str,
     input: i64,
     output: i64,
     cache_creation: i64,
     cache_read: i64,
     total: i64,
-) {
-    models.entry(model.to_string()).or_default().add(
-        input,
-        output,
-        cache_creation,
-        cache_read,
-        total,
-    );
+) -> bool {
+    let Some(usage) = summary_entry(models, model, room) else {
+        return false;
+    };
+    usage.add(input, output, cache_creation, cache_read, total);
+    true
 }
 
 impl SessionEvents {
@@ -2101,7 +2229,7 @@ impl SessionEvents {
         ts_ms: Option<i64>,
         text: &str,
         task_path: Vec<String>,
-    ) -> Option<usize> {
+    ) -> usize {
         let hash = short_hash(text, 12);
         if let Some(existing) = self.prompts.iter().rposition(|prompt| {
             prompt.text_hash == hash
@@ -2114,7 +2242,7 @@ impl SessionEvents {
                     _ => false,
                 }
         }) {
-            return Some(existing);
+            return existing;
         }
         let index = self.prompts.len();
         built.push(&mut self.prompts, UserPrompt {
@@ -2125,8 +2253,8 @@ impl SessionEvents {
             preview: truncate_clean(text, 180),
             tag: String::new(),
             task_path,
-        })?;
-        Some(index)
+        });
+        index
     }
 }
 
@@ -3616,13 +3744,31 @@ fn first_json_string(obj: &Value, keys: &[&str], pointers: &[&str]) -> Option<St
         .map(str::to_string)
 }
 
-fn claude_usage_key(obj: &Value) -> String {
+/// The most usage reports one Claude session tells apart. Of 541 real
+/// transcripts, the most has 4,741 (in 125 MiB).
+const MAX_SEEN_USAGE: usize = 1 << 16;
+
+/// Whether a Claude usage report is new, told apart by a 64-bit hash of its
+/// key, so the set costs the same whatever the keys' length. Past
+/// [`MAX_SEEN_USAGE`] a new report is not counted and marks the session
+/// truncated.
+fn claude_usage_is_new(seen: &mut HashSet<u64>, obj: &Value, truncated: &mut bool) -> bool {
+    let mut hasher = std::hash::DefaultHasher::new();
     obj.get("requestId")
         .or_else(|| obj.pointer("/message/id"))
         .or_else(|| obj.get("uuid"))
         .and_then(Value::as_str)
         .unwrap_or("usage")
-        .to_string()
+        .hash(&mut hasher);
+    let key = hasher.finish();
+    if seen.contains(&key) {
+        return false;
+    }
+    if seen.len() >= MAX_SEEN_USAGE {
+        *truncated = true;
+        return false;
+    }
+    seen.insert(key)
 }
 
 fn claude_source_completion_id(obj: &Value) -> String {
@@ -3968,12 +4114,12 @@ mod tests {
         fs::remove_dir_all(home).expect("remove scratch directory");
     }
 
-    /// A scan finishes past a FIFO. A file over the cap is read as its newest
-    /// whole lines, at most the cap: a session after a long hole parses, and
-    /// one line longer than the cap gives nothing.
+    /// A scan finishes past a FIFO. A line over the limit is skipped and
+    /// marks its session truncated, and the lines after it still count; a
+    /// file of only such a line gives nothing.
     #[cfg(unix)]
     #[test]
-    fn a_scan_finishes_past_a_fifo_and_reads_at_most_the_end_of_a_long_file() {
+    fn a_scan_finishes_past_a_fifo_and_skips_a_line_over_the_limit() {
         use std::io::Write;
         let home = scratch("agentsight-scan");
         let project = home.join(".claude/projects/-w");
@@ -3983,73 +4129,121 @@ mod tests {
         let long = project.join("long.jsonl");
         fs::File::create(&long)
             .expect("long file")
-            .set_len(2 * MAX_SESSION_FILE_BYTES)
+            .set_len(2 * MAX_LINE_BYTES as u64)
             .expect("one long line");
         let huge = project.join("huge.jsonl");
-        fs::copy(&long, &huge).expect("a line longer than the cap");
+        fs::copy(&long, &huge).expect("a line longer than the limit");
         let mut file = fs::OpenOptions::new()
             .append(true)
             .open(&long)
             .expect("append");
-        write!(file, "\n{CLAUDE_SESSION}").expect("the newest session lines");
+        write!(file, "\n{CLAUDE_SESSION}").expect("the session lines after it");
         drop(file);
 
         let (done, finished) = std::sync::mpsc::channel();
         let scanned = home.clone();
         std::thread::spawn(move || {
-            let sessions = discover_session_files_in_home(&scanned)
+            let sessions: Vec<_> = discover_session_files_in_home(&scanned)
                 .iter()
                 .filter_map(parse_session_file)
-                .count();
+                .map(|session| (session.path.file_name().unwrap().to_owned(), session.truncated, session.usage.total_tokens))
+                .collect();
             done.send(sessions).expect("report the scan");
         });
-        let sessions = finished
+        let mut sessions = finished
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("the scan blocked on a session file");
+        sessions.sort();
 
-        assert_eq!(sessions, 2, "the real session and the long file's end");
-        assert_eq!(
-            read_session_file(&long, true).expect("read the long file"),
-            CLAUDE_SESSION
-        );
-        assert_eq!(read_session_file(&huge, true).expect("read the huge line"), "");
+        assert_eq!(sessions, [("long.jsonl".into(), true, 11), ("real.jsonl".into(), false, 11)]);
         fs::remove_dir_all(home).expect("remove scratch directory");
     }
 
-    /// A value one line sets is copied into every later event, so a file well
-    /// under the window can build hundreds of MiB (Sol r3: a 200 KiB model,
-    /// measured at 314 MiB). Such a parse stops at the cache's budget and gives
-    /// no session; an honest file still parses.
+    /// A file past the read limit is read up to it, and the session is
+    /// marked truncated.
     #[cfg(unix)]
     #[test]
-    fn a_file_that_builds_past_the_budget_gives_no_session() {
-        let home = scratch("agentsight-built");
+    fn a_file_past_the_read_limit_is_read_up_to_it() {
+        let home = scratch("agentsight-limit");
         let project = home.join(".claude/projects/-w");
         fs::create_dir_all(&project).expect("project");
+        let path = project.join("s.jsonl");
+        fs::write(&path, CLAUDE_SESSION).expect("session");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_len(MAX_READ_BYTES + 1)
+            .expect("a hole past the limit");
+        let session = parse_session_path(&path).expect("the lines before the limit");
+        assert!(session.truncated);
+        assert_eq!(session.usage.total_tokens, 11);
+        fs::remove_dir_all(home).expect("remove scratch directory");
+    }
+
+    /// A value one line sets is copied into every later event, so a short file
+    /// can build hundreds of MiB (Sol r3: a 200 KiB model, measured at 314
+    /// MiB). Past the cache's budget a parse keeps no more events, but still
+    /// counts every tool call, and marks the session truncated.
+    #[test]
+    fn a_file_that_builds_past_the_budget_keeps_its_totals() {
         let big = "m".repeat(200 * 1024);
         let shapes = [
             (
                 format!(r#"{{"type":"assistant","message":{{"model":"{big}","usage":{{}}}}}}"#),
-                r#"{"type":"assistant","message":{"usage":{}}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}],"usage":{}}}"#,
+                0,
             ),
             (
                 format!(
                     r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Skill","input":{{"skill":"{big}"}}}}]}}}}"#
                 ),
                 r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{}}]}}"#,
+                1500,
             ),
         ];
-        for (n, (first, tiny)) in shapes.iter().enumerate() {
+        for (n, (first, tiny, reads)) in shapes.iter().enumerate() {
             let body = format!("{first}\n{}", format!("{tiny}\n").repeat(1500));
-            assert!((body.len() as u64) < MAX_SESSION_FILE_BYTES, "under the window");
-            let path = project.join(format!("s{n}.jsonl"));
-            fs::write(&path, body).expect("session");
-            assert!(parse_session_path(&path).is_none(), "shape {n} built past the budget");
+            let session = parse_session_content(AGENT_CLAUDE, Path::new("/tmp/s.jsonl"), UNIX_EPOCH, &body)
+                .expect("a session");
+            assert!(session.truncated, "shape {n}");
+            assert!(json_len(&session.events) <= MAX_CACHED_SESSION_BYTES, "shape {n} kept past the budget");
+            assert_eq!(session.tools.get("Read").copied().unwrap_or(0), *reads, "shape {n}");
         }
-        let honest = project.join("honest.jsonl");
-        fs::write(&honest, CLAUDE_SESSION).expect("honest session");
-        assert!(parse_session_path(&honest).is_some(), "an honest session parses");
-        fs::remove_dir_all(home).expect("remove scratch directory");
+        let honest = parse_session_content(AGENT_CLAUDE, Path::new("/tmp/s.jsonl"), UNIX_EPOCH, CLAUDE_SESSION)
+            .expect("an honest session");
+        assert!(!honest.truncated);
+    }
+
+    /// A new key past the summary budget is not counted, and marks the
+    /// session truncated; calls of a tool already named still count.
+    #[test]
+    fn keys_past_the_summary_budget_mark_the_session_truncated() {
+        let body: String = (0..5000)
+            .map(|n| format!("{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"name\":\"Read\",\"input\":{{\"file_path\":\"/w/{n:0>60}\"}}}}]}}}}\n"))
+            .collect();
+        let session = parse_session_content(AGENT_CLAUDE, Path::new("/tmp/s.jsonl"), UNIX_EPOCH, &body)
+            .expect("a session");
+        assert!(session.truncated);
+        assert_eq!(session.tools["Read"], 5000);
+        let cost: usize = session.files.keys().map(|k| k.len() + SUMMARY_KEY_COST).sum();
+        assert!(session.files.len() < 5000 && cost <= MAX_SUMMARY_KEY_BYTES, "{cost}");
+    }
+
+    /// Usage reports past the most a session tells apart are not counted,
+    /// and mark the session truncated.
+    #[test]
+    fn usage_reports_past_the_most_told_apart_mark_the_session_truncated() {
+        let line = |n: usize| format!("{{\"type\":\"assistant\",\"requestId\":\"{n}\",\"message\":{{\"model\":\"m\",\"usage\":{{\"input_tokens\":1}}}}}}\n");
+        let parse = |reports: usize| {
+            let body: String = (0..reports).map(line).collect();
+            parse_session_content(AGENT_CLAUDE, Path::new("/tmp/s.jsonl"), UNIX_EPOCH, &body).expect("a session")
+        };
+        // Both keep events past the cache's budget too; the counts tell them apart.
+        assert_eq!(parse(MAX_SEEN_USAGE).usage.input_tokens, MAX_SEEN_USAGE as i64);
+        let past = parse(MAX_SEEN_USAGE + 1);
+        assert!(past.truncated);
+        assert_eq!(past.usage.input_tokens, MAX_SEEN_USAGE as i64);
     }
 
     /// The read itself opens only a regular file, whatever discovery saw: not
@@ -4064,7 +4258,7 @@ mod tests {
         mkfifo(&fifo);
 
         for path in [zero.as_path(), fifo.as_path(), Path::new("/dev/zero")] {
-            assert!(read_session_file(path, true).is_err(), "{path:?}");
+            assert!(open_session_file(path).is_err(), "{path:?}");
         }
         fs::remove_dir_all(dir).expect("remove scratch directory");
     }
@@ -4103,17 +4297,17 @@ mod tests {
         }
     }
 
-    /// Gemini's session is one JSON document: a window would cut its opening,
-    /// so it is read whole.
+    /// Gemini's session is one JSON document, so it is read whole, not as
+    /// lines.
     #[test]
-    fn a_gemini_document_over_the_window_is_read_whole() {
+    fn a_gemini_document_longer_than_a_line_is_read_whole() {
         let home = scratch("agentsight-gemini");
         let chats = home.join(".gemini/tmp/p/chats");
         fs::create_dir_all(&chats).expect("chats");
-        let text = "x".repeat(MAX_SESSION_FILE_BYTES as usize);
+        let text = "x".repeat(MAX_LINE_BYTES);
         let path = chats.join("session-1.json");
         fs::write(&path, format!(r#"{{"messages":[{{"type":"user","content":"{text}"}},{{"type":"gemini","timestamp":"2026-01-01T00:00:00Z","toolCalls":[{{"id":"t1","name":"write_file","args":{{"file_path":"src/lib.rs"}},"status":"success"}}]}}]}}"#)).expect("session");
-        assert!(parse_session_path(&path).is_some(), "a Gemini session over the window gave nothing");
+        assert!(parse_session_path(&path).is_some(), "a Gemini session longer than a line gave nothing");
         fs::remove_dir_all(home).expect("remove scratch directory");
     }
 

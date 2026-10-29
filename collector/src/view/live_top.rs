@@ -11,7 +11,7 @@ use crate::view::process_select;
 use crate::view::session_process_match::{
     LiveProcessCandidate, SessionProcessMatch, SessionProcessMatcher, session_path_from_raw_path,
 };
-use crate::view::top::{recent_failures, sort_agent_rows, top_sections};
+use crate::view::top::{recent_failures, session_tool_counts, sort_agent_rows, top_sections};
 #[cfg(unix)]
 use agentsight_protocol::bridge::HostSessionRow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -302,11 +302,8 @@ impl LiveView {
                 .as_ref()
                 .and_then(|(row, _)| row.age_s)
                 .or_else(|| session_age_s(session));
-            let tools = session_snapshot
-                .tool_calls
-                .iter()
-                .filter(|tool| tool.session_id.as_deref() == Some(session.id.as_str()))
-                .count();
+            let tool_counts = session_tool_counts(session);
+            let tools = tool_counts.values().sum::<i64>() as usize;
             let workspace = session_attr(session, "cwd")
                 .map(ToString::to_string)
                 .or_else(|| {
@@ -314,19 +311,7 @@ impl LiveView {
                         .and_then(|(row, _)| row.workspace.as_ref())
                         .cloned()
                 });
-            let tool_breakdown = {
-                let mut counts = BTreeMap::new();
-                for tool in session_snapshot
-                    .tool_calls
-                    .iter()
-                    .filter(|t| t.session_id.as_deref() == Some(session.id.as_str()))
-                {
-                    if let Some(name) = &tool.tool_name {
-                        *counts.entry(name.clone()).or_insert(0i64) += 1;
-                    }
-                }
-                crate::output::sorted_top_counts(counts, 10)
-            };
+            let tool_breakdown = crate::output::sorted_top_counts(tool_counts, 10);
             let file_breakdown = session
                 .attributes
                 .get("files")
@@ -807,6 +792,37 @@ mod tests {
         assert_eq!(top.rows.len(), 1);
         assert_eq!(top.rows[0].pid, Some(1));
         assert_eq!(top.rows[0].trace, "proc");
+    }
+
+    /// A session snapshot keeps only a sample of its tool rows, so a row's tool
+    /// count, its breakdown and the Tools section come from the session's
+    /// `tools` counts.
+    #[test]
+    fn top_counts_tools_from_the_session_not_its_sampled_rows() {
+        let (_temp, path) = agent_native_sessions::create_temp_session_path("claude");
+        let line = |name: &str| format!("{{\"type\":\"assistant\",\"message\":{{\"model\":\"m\",\"content\":[{{\"type\":\"tool_use\",\"name\":\"{name}\",\"input\":{{}}}}],\"usage\":{{\"input_tokens\":1}}}}}}\n");
+        let content = line("Read").repeat(30) + &line("Bash").repeat(10);
+        let session =
+            agent_native_sessions::parse_content_for_test("claude", &path, std::time::UNIX_EPOCH, &content)
+                .unwrap();
+        let mut session_snapshot = agent_native_sessions::materialized_view(&[session])
+            .export_snapshot(SnapshotOptions { audit_limit: 0 });
+        session_snapshot.tool_calls.truncate(1);
+        let options = TopOptions {
+            pid: None,
+            comm: None,
+            sort: "cpu".to_string(),
+            view: "all".to_string(),
+        };
+
+        let top = LiveView::default().build_top(&LiveSample::default(), None, &session_snapshot, &options);
+
+        assert_eq!(top.rows.len(), 1);
+        assert_eq!(top.rows[0].tools, 40);
+        let calls = vec![("Read".to_string(), 30), ("Bash".to_string(), 10)];
+        assert_eq!(top.rows[0].tool_breakdown, calls);
+        let tools = top.sections.iter().find(|(title, _, _)| *title == "Tools").unwrap();
+        assert_eq!(tools.2, calls);
     }
 
     #[test]

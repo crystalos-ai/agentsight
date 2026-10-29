@@ -757,6 +757,7 @@ mod tests {
                 llm_responses: Vec::new(),
                 plan: Vec::new(),
             },
+            truncated: false,
         }
     }
 
@@ -925,7 +926,8 @@ mod tests {
 
         let candidate = SessionCandidate {
             agent: AGENT_CURSOR,
-            path: parent,
+            // A session file is read at its real path; macOS's temp folder is behind a link.
+            path: parent.canonicalize().expect("parent transcript path"),
             updated: SystemTime::UNIX_EPOCH,
         };
         let (session, source_count) = repository_session(&candidate).expect("repository session");

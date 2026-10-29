@@ -1326,6 +1326,7 @@ mod tests {
             cwd: None,
             last_message_at: None,
             events: Default::default(),
+            truncated: false,
         }
     }
 

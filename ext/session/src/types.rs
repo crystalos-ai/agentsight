@@ -10,12 +10,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::{discover_session_files, parse_session_file};
 
-/// The most session data one cache keeps, as the JSON length of its parsed
-/// sessions. An honest transcript read through the parser's 512 KiB window
-/// gives under 200 KiB, but a transcript written to be costly (Bash calls
-/// naming many paths) gives about five times its bytes, takes about three
-/// times that in memory, and is kept in up to three copies. A session past the
-/// budget is dropped until its file changes.
+/// The most session data one cache keeps with events, as the JSON length of
+/// its parsed sessions, and the most one parse keeps. The largest of 541 real
+/// Claude transcripts parses to 10 MB, and 3 pass 8 MiB; a transcript written
+/// to be costly (Bash calls naming many paths) gives about five times its
+/// bytes, takes about three times that in memory, and is kept in up to three
+/// copies. A session past the budget keeps its totals without its events, and
+/// is marked truncated, until its file changes.
 pub(crate) const MAX_CACHED_SESSION_BYTES: usize = 8 * 1024 * 1024;
 
 /// Token usage statistics for a model or session.
@@ -206,6 +207,11 @@ pub struct AgentSession {
     /// Vendor-neutral interaction events extracted from agent-native transcripts.
     #[serde(default)]
     pub events: SessionEvents,
+    /// Some of the session was not read or kept: a line past the parser's
+    /// limit, the end of a file past its read limit, or events and keys past
+    /// a budget. Totals then count only what was read.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// A candidate session file discovered on disk.
@@ -364,16 +370,13 @@ impl SessionCache {
                     }
                 })
                 .or_insert_with(|| CacheEntry::parse(&candidate, false));
-            if entry.session.is_some() {
+            if let Some(session) = entry.session.as_mut() {
                 match kept_bytes.checked_add(entry.bytes) {
                     Some(total) if total <= MAX_CACHED_SESSION_BYTES => kept_bytes = total,
                     _ => {
-                        log::warn!(
-                            "dropping session {}: its {} bytes exceed the cache's budget",
-                            candidate.path.display(),
-                            entry.bytes
-                        );
-                        entry.session = None;
+                        session.events = SessionEvents::default();
+                        session.truncated = true;
+                        entry.bytes = crate::parser::json_len(session);
                     }
                 }
             }
@@ -401,8 +404,8 @@ mod tests {
     use crate::discover_session_files_in_home;
     use std::fs;
 
-    /// Under the parser's 512 KiB window of Bash calls, each naming 1,500
-    /// distinct paths: a transcript that parses to about five times its bytes.
+    /// 480 KiB of Bash calls, each naming 1,500 distinct paths: a transcript
+    /// that parses to about five times its bytes.
     fn costly_transcript() -> String {
         let mut out = String::new();
         for call in 0.. {
@@ -418,9 +421,9 @@ mod tests {
         out
     }
 
-    /// The cache keeps sessions, newest first, only while their total fits its
-    /// budget: costly transcripts past it are dropped, and an older honest
-    /// session still fits after them.
+    /// The cache keeps sessions' events, newest first, only while their total
+    /// fits its budget: costly transcripts past it keep their totals without
+    /// events, and an older honest session still fits after them.
     #[test]
     fn the_cache_keeps_sessions_only_within_its_budget() {
         let home = std::env::temp_dir().join(format!("agentsight-budget-{}", std::process::id()));
@@ -445,30 +448,26 @@ mod tests {
         let mut cache = SessionCache::new();
         cache.refresh_from(discover_session_files_in_home(&home), 25, &[]);
 
-        let bytes = |kept: bool| -> usize {
-            cache
-                .entries
-                .values()
-                .filter(|e| e.session.is_some() == kept)
-                .map(|e| e.bytes)
-                .sum()
-        };
-        assert!(
-            bytes(true) + bytes(false) > MAX_CACHED_SESSION_BYTES,
-            "the transcripts together must exceed the budget"
-        );
-        assert!(bytes(true) <= MAX_CACHED_SESSION_BYTES);
-        let shown: Vec<&str> = cache
-            .cached_sessions
+        let sessions = &cache.cached_sessions;
+        let with_events: usize = cache
+            .entries
+            .values()
+            .filter_map(|e| e.session.as_ref().filter(|s| !s.events.tools.is_empty()).map(|_| e.bytes))
+            .sum();
+        assert!(with_events <= MAX_CACHED_SESSION_BYTES);
+        let shown: Vec<(&str, bool)> = sessions
             .iter()
-            .filter_map(|s| s.path.file_name()?.to_str())
+            .map(|s| (s.path.file_name().unwrap().to_str().unwrap(), s.events.tools.is_empty() && s.events.llm_responses.is_empty()))
             .collect();
-        assert_eq!(shown.first(), Some(&"costly-4.jsonl"), "the newest first");
-        assert_eq!(shown.last(), Some(&"honest.jsonl"));
-        assert!(
-            shown.len() < 5,
-            "a costly transcript was dropped: {shown:?}"
-        );
+        assert_eq!(shown.len(), 5, "every session is shown: {shown:?}");
+        assert_eq!(shown[0], ("costly-4.jsonl", false), "the newest first, with events");
+        assert_eq!(shown[4], ("honest.jsonl", false), "an honest session after them keeps its events");
+        let trimmed: Vec<_> = sessions.iter().filter(|s| s.events.llm_responses.is_empty()).collect();
+        assert!(!trimmed.is_empty(), "a costly transcript past the budget: {shown:?}");
+        for session in trimmed {
+            assert!(session.truncated);
+            assert_eq!(session.tools["Bash"], sessions[0].tools["Bash"], "its totals are kept");
+        }
         fs::remove_dir_all(home).expect("remove scratch directory");
     }
 }

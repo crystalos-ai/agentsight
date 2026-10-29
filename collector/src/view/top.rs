@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 eunomia-bpf org.
 
-use crate::model::Snapshot;
+use crate::model::{SessionRow, Snapshot};
 use crate::output::{AgentTopRow, TopSection, sorted_top_counts, top_counts_from_iter};
 use std::collections::BTreeMap;
 
@@ -47,17 +47,15 @@ pub(crate) fn top_sections(snapshot: &Snapshot, limit: usize, view: &str) -> Vec
         }),
         ("Network", "events", network_counts(snapshot, limit)),
         ("Models", "tokens", sorted_top_counts(model_counts, limit)),
-        (
-            "Tools",
-            "calls",
-            top_counts_from_iter(
-                snapshot
-                    .tool_calls
-                    .iter()
-                    .filter_map(|row| row.tool_name.clone()),
-                limit,
-            ),
-        ),
+        ("Tools", "calls", {
+            let mut counts = BTreeMap::new();
+            for session in &snapshot.sessions {
+                for (name, count) in session_tool_counts(session) {
+                    *counts.entry(name).or_insert(0i64) += count;
+                }
+            }
+            sorted_top_counts(counts, limit)
+        }),
     ];
     all.into_iter()
         .filter(|(title, _, _)| show_section(view, title))
@@ -103,6 +101,22 @@ fn network_audit_counts(snapshot: &Snapshot, limit: usize) -> Vec<(String, i64)>
             .filter_map(|row| row.target.clone()),
         limit,
     )
+}
+
+/// A session's tool calls by name, from its `tools` attribute: a session
+/// snapshot keeps only a sample of its tool rows.
+pub(crate) fn session_tool_counts(session: &SessionRow) -> BTreeMap<String, i64> {
+    session
+        .attributes
+        .get("tools")
+        .and_then(|v| v.as_object())
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|(name, count)| (name.clone(), count.as_i64().unwrap_or(0)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn files_from_sessions(snapshot: &Snapshot, limit: usize) -> Vec<(String, i64)> {

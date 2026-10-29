@@ -48,8 +48,14 @@ pub fn snapshot(
     max_age: Duration,
 ) -> Snapshot {
     let filtered = discover_sessions(cache, pid_filter, text_filter, limit, max_age);
-    materialized_view(&filtered).export_snapshot(SnapshotOptions { audit_limit: 0 })
+    view_of(&filtered, SNAPSHOT_TOOL_ROWS_PER_SESSION)
+        .export_snapshot(SnapshotOptions { audit_limit: 0 })
 }
+
+/// The most tool rows a session gives a `snapshot`. Its session row's `tools`
+/// attribute counts every call, so a long session costs a row per call only
+/// in the views that list calls.
+const SNAPSHOT_TOOL_ROWS_PER_SESSION: usize = 16;
 
 pub fn discover_sessions(
     cache: &mut SessionCache,
@@ -185,6 +191,7 @@ fn codex_state_session(
             plan,
             ..Default::default()
         },
+        truncated: false,
     }
 }
 
@@ -656,9 +663,13 @@ fn view_id(session: &LocalSession) -> String {
 }
 
 pub fn materialized_view(sessions: &[LocalSession]) -> MaterializedView {
+    view_of(sessions, usize::MAX)
+}
+
+fn view_of(sessions: &[LocalSession], tool_rows_per_session: usize) -> MaterializedView {
     let mut view = MaterializedView::new();
     view.set_source(AGENT_NATIVE_SOURCE);
-    import_into_view(&mut view, sessions);
+    import_sessions(&mut view, sessions, tool_rows_per_session);
     view
 }
 
@@ -672,6 +683,14 @@ pub fn import_recent(view: &mut MaterializedView, limit: usize) {
 }
 
 pub fn import_into_view(view: &mut MaterializedView, sessions: &[LocalSession]) {
+    import_sessions(view, sessions, usize::MAX);
+}
+
+fn import_sessions(
+    view: &mut MaterializedView,
+    sessions: &[LocalSession],
+    tool_rows_per_session: usize,
+) {
     for session in sessions {
         // Sessions flow to bridge consumers as mutations, so this goes through
         // `emit_session` rather than a bare upsert.
@@ -682,7 +701,7 @@ pub fn import_into_view(view: &mut MaterializedView, sessions: &[LocalSession]) 
         for row in token_rows(session) {
             view.apply_token_usage(&row);
         }
-        for row in tool_rows(session) {
+        for row in tool_rows(session, tool_rows_per_session) {
             view.apply_tool_call(&row);
         }
     }
@@ -1130,6 +1149,7 @@ fn session_row(session: &LocalSession) -> SessionRow {
             "cwd": session.cwd.clone(),
             "last_message_at": session.last_message_at.clone(),
             "files": session.files,
+            "tools": session.tools,
             "plan": session.events.plan,
             "usage": session.usage,
             "subscription": subscription,
@@ -1163,12 +1183,16 @@ fn token_rows(session: &LocalSession) -> Vec<TokenUsageRow> {
         .collect()
 }
 
-fn tool_rows(session: &LocalSession) -> Vec<ToolCallRow> {
+/// One row per tool call, at most `limit`.
+fn tool_rows(session: &LocalSession, limit: usize) -> Vec<ToolCallRow> {
     let session_id = view_id(session);
     let timestamp_ms = updated_ms(session);
     let mut rows = Vec::new();
     for (tool, count) in &session.tools {
         for index in 0..*count {
+            if rows.len() == limit {
+                return rows;
+            }
             rows.push(ToolCallRow {
                 id: format!("tool-{session_id}-{}-{index}", sanitize_id(tool)),
                 session_id: Some(session_id.clone()),
@@ -1697,6 +1721,26 @@ mod tests {
         assert_eq!(stats[0].bytes, 3);
     }
 
+    /// A snapshot gives at most a sample of a session's tool rows; its session
+    /// row counts every call.
+    #[test]
+    fn a_snapshot_samples_tool_rows_and_counts_every_call() {
+        let (_temp, path) = create_temp_session_path("claude");
+        let line = r#"{"type":"assistant","message":{"model":"m","content":[{"type":"tool_use","name":"Read","input":{}}],"usage":{"input_tokens":1}}}"#;
+        let content = format!("{line}\n").repeat(SNAPSHOT_TOOL_ROWS_PER_SESSION * 3);
+        let session = parse_content_for_test("claude", &path, UNIX_EPOCH, &content).unwrap();
+
+        let snapshot = view_of(std::slice::from_ref(&session), SNAPSHOT_TOOL_ROWS_PER_SESSION)
+            .export_snapshot(SnapshotOptions { audit_limit: 0 });
+        assert_eq!(snapshot.tool_calls.len(), SNAPSHOT_TOOL_ROWS_PER_SESSION);
+        assert_eq!(
+            snapshot.sessions[0].attributes["tools"]["Read"],
+            SNAPSHOT_TOOL_ROWS_PER_SESSION * 3
+        );
+        let full = materialized_view(&[session]).export_snapshot(SnapshotOptions { audit_limit: 0 });
+        assert_eq!(full.tool_calls.len(), SNAPSHOT_TOOL_ROWS_PER_SESSION * 3);
+    }
+
     #[test]
     fn cursor_discovery_emits_parent_candidates_only() {
         let temp = tempfile::tempdir().unwrap();
@@ -1714,7 +1758,8 @@ mod tests {
             .collect();
 
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].path, transcripts.join("abc.jsonl"));
+        // Discovery names a file by its real path; macOS's temp folder is behind a link.
+        assert_eq!(candidates[0].path, fs::canonicalize(transcripts.join("abc.jsonl")).unwrap());
     }
 
     #[test]
@@ -1766,7 +1811,7 @@ mod tests {
             .collect();
 
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].path, real.join("abc.jsonl"));
+        assert_eq!(candidates[0].path, fs::canonicalize(real.join("abc.jsonl")).unwrap());
     }
 
     #[test]
