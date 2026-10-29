@@ -364,10 +364,14 @@ impl SessionCache {
         let mut seen = HashSet::new();
         let mut kept_bytes = 0usize;
 
-        for candidate in candidates
-            .into_iter()
-            .take(target.saturating_mul(3).clamp(10, 75))
-        {
+        candidates.truncate(target.saturating_mul(3).clamp(10, 75));
+        // Drop what no candidate names before parsing anything new, so the old
+        // and the new sessions are not held together.
+        self.entries.retain(|path, entry| {
+            candidates.iter().any(|candidate| &candidate.path == path)
+                || (entry.pinned && path.is_file())
+        });
+        for candidate in candidates {
             live_paths.insert(candidate.path.clone());
             let entry = self
                 .entries

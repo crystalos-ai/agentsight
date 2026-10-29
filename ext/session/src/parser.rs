@@ -1969,6 +1969,11 @@ const SUMMARY_KEY_COST: usize = 64;
 /// truncated.
 const MAX_NAME_BYTES: usize = 256;
 const MAX_MODELS: usize = 64;
+
+/// The longest working directory (a path, as `PATH_MAX`) and last-message
+/// timestamp a session keeps.
+const MAX_CWD_BYTES: usize = 4096;
+const MAX_TIMESTAMP_BYTES: usize = 64;
 const OTHER_NAME: &str = "(other)";
 
 /// Whether `room` holds a new `key`, taking its cost if so.
@@ -2108,6 +2113,19 @@ impl SessionAccumulator {
         {
             return None;
         }
+        // A view copies these into each session's row, and the cache keeps them
+        // for a session past its budget. Real ones are far shorter; a longer
+        // one is not kept and marks the session truncated.
+        let mut truncated = self.truncated;
+        let mut short = |value: Option<String>, max: usize| {
+            value.filter(|value| {
+                truncated |= value.len() > max;
+                value.len() <= max
+            })
+        };
+        let model = short(self.model, MAX_NAME_BYTES);
+        let cwd = short(self.cwd, MAX_CWD_BYTES);
+        let last_message_at = short(self.last_message_at, MAX_TIMESTAMP_BYTES);
         let display_id = format!("{}:{}", self.agent_type, short_session_id(&self.session_id));
         Some(AgentSession {
             agent_type: self.agent_type,
@@ -2120,17 +2138,17 @@ impl SessionAccumulator {
                 .start_timestamp_ms
                 .or_else(|| Some(system_time_ms(self.updated).saturating_sub(self.duration_ms))),
             end_timestamp_ms: self.end_timestamp_ms,
-            model: self.model,
+            model,
             usage: token_usage,
             model_usage: self.model_usage,
             tools: self.tools,
             files: self.files,
             prompt_preview: self.prompt_preview,
             duration_ms: self.duration_ms,
-            cwd: self.cwd,
-            last_message_at: self.last_message_at,
+            cwd,
+            last_message_at,
             events: SessionEvents::default(),
-            truncated: self.truncated,
+            truncated,
         })
     }
 
@@ -4289,6 +4307,19 @@ mod tests {
         assert_eq!(session.tools[OTHER_NAME], calls);
         assert_eq!(session.model_usage.len(), MAX_MODELS + 1);
         assert_eq!(session.usage.input_tokens, calls as i64);
+    }
+
+    /// A model, working directory or timestamp longer than a real one is not
+    /// kept, and marks the session truncated.
+    #[test]
+    fn a_long_model_cwd_or_timestamp_is_not_kept() {
+        let long = "x".repeat(300 * 1024);
+        let body = format!("{{\"type\":\"assistant\",\"cwd\":\"/{long}\",\"timestamp\":\"{long}\",\"message\":{{\"model\":\"{long}\",\"usage\":{{\"input_tokens\":1}}}}}}\n");
+        let session = parse_session_content(AGENT_CLAUDE, Path::new("/tmp/s.jsonl"), UNIX_EPOCH, &body)
+            .expect("a session");
+        assert!(session.truncated);
+        assert_eq!((session.model, session.cwd, session.last_message_at), (None, None, None));
+        assert_eq!(session.usage.input_tokens, 1);
     }
 
     /// A link at the file name is not followed: the candidate names the link,
